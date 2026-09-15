@@ -17,14 +17,18 @@ Use Rust at least as recent as `codex-rs/rust-toolchain.toml`. The FreeBSD Rust
 package includes Cargo, rustfmt, and Clippy. The build uses the system `protoc`
 on FreeBSD, or the executable specified by `PROTOC`.
 
+Build as your regular user:
+
 ```sh
 git clone -b freebsd-support https://github.com/ajzrva-sys/codex.git
 cd codex
 python3 scripts/freebsd/package.py
-npm install -g ./dist/freebsd/openai-codex-0.0.0-freebsd.tgz
-codex --version
-codex login --device-auth
-codex
+```
+
+Install the resulting package as root, using the absolute path to your tarball:
+
+```sh
+npm install -g /absolute/path/to/codex/dist/freebsd/openai-codex-0.0.0-freebsd.tgz
 ```
 
 For a faster development build, pass `--profile dev-small`. To package an
@@ -37,6 +41,28 @@ The tarball includes the native CLI, code-mode helper, ripgrep, and the patched 
 It is self-contained with respect to npm dependencies. The official npm
 registry package does not yet distribute a FreeBSD binary; reinstalling that
 package will not install this branch's build.
+
+## Run as your regular user
+
+Return to your regular user account before signing in or starting Codex. The
+global installation is available to ordinary users; running Codex does not
+require root. Credentials and configuration belong to the account that runs it
+and are stored in that account's `~/.codex` by default.
+
+```sh
+codex --version
+codex login --device-auth
+codex login status
+codex -a on-request -s workspace-write
+```
+
+Interactive sessions can ask you to approve individual file edits. With
+`workspace-write`, the missing FreeBSD OS sandbox prevents `apply_patch` from
+automatically approving even edits inside the project. Noninteractive
+`codex exec --sandbox workspace-write` cannot ask for approval and rejects
+those patches, potentially reporting "writing outside of the project" even
+when the target is inside it. This is an approval-policy limitation, not a
+reason to run as root.
 
 ## Scope
 
@@ -58,7 +84,9 @@ that require code mode cannot execute tools without the helper.
 
 Native validation covers the terminal UI, shell and patch tool execution in
 both direct and code mode, a live authenticated default-model session, 234
-Rust tests, and six npm launcher tests. Descriptor cleanup uses FreeBSD's
+Rust tests, and six npm launcher tests. A live session under an ordinary user
+also verified shell execution and an interactively approved file edit owned by
+that user. Descriptor cleanup uses FreeBSD's
 `close_range` with `CLOSE_RANGE_CLOEXEC` rather than requiring an fdescfs mount.
 
 ```sh
