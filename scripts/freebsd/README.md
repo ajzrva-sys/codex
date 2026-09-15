@@ -102,6 +102,9 @@ writable directory therefore use a content snapshot for that command. Writable
 file exceptions inside a read-only directory use a private snapshot of the
 parent's directory entries; writes to the granted file still reach the host.
 Each tool invocation constructs a fresh view.
+Streamed file reads copy the jailed file into an anonymous temporary snapshot
+outside the jail, using bounded buffers. No host socket is passed into the jail
+to transfer descriptors.
 
 To grant another directory, add its absolute path with `"read"`, `"write"`, or
 `"deny"` under `[permissions.freebsd-workspace.filesystem]`. Concrete nested

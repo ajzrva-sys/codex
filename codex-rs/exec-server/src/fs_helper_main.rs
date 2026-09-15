@@ -45,7 +45,7 @@ async fn run_main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 let path = params.path.to_abs_path()?;
                 let file = regular_file::open(path.as_path()).await?;
                 // Unix can hand the opened fd directly to the parent.
-                #[cfg(unix)]
+                #[cfg(all(unix, not(target_os = "freebsd")))]
                 crate::sandboxed_file_open::transfer_file(&file)?;
                 let response = FsHelperOpenResponse {
                     // Windows duplicates from the helper process instead.
@@ -77,6 +77,14 @@ async fn run_main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .await?;
     stdout.write_all(b"\n").await?;
     stdout.flush().await?;
+
+    // The FreeBSD jail relay carries bytes, never host sockets or descriptors.
+    // Stream the opened file after its status header into the parent's snapshot.
+    #[cfg(target_os = "freebsd")]
+    if let Some(file) = &mut opened_file {
+        tokio::io::copy(file, &mut stdout).await?;
+        stdout.flush().await?;
+    }
 
     // Keep the Windows handle alive until the parent duplicates it.
     #[cfg(windows)]

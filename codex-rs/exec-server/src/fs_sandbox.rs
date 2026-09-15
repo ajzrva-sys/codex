@@ -23,7 +23,7 @@ use codex_utils_absolute_path::canonicalize_preserving_symlinks;
 use codex_utils_path_uri::PathUri;
 #[cfg(any(windows, test))]
 use tokio::io::AsyncBufReadExt;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "freebsd", test))]
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -41,7 +41,7 @@ use crate::rpc::invalid_request;
 const FS_HELPER_ENV_ALLOWLIST: &[&str] = &["PATH", "TMPDIR", "TMP", "TEMP"];
 #[cfg(any(windows, test))]
 const FS_HELPER_EXIT_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 2);
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "freebsd", test))]
 const MAX_FS_HELPER_STDERR_BYTES: u64 = 4096;
 #[cfg(debug_assertions)]
 const FS_HELPER_BAZEL_BWRAP_ENV_ALLOWLIST: &[&str] = &[
@@ -398,7 +398,7 @@ pub(crate) async fn read_helper_response(
     Ok(response)
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "freebsd", test))]
 pub(crate) fn drain_helper_stderr(
     child: &mut tokio::process::Child,
 ) -> tokio::task::JoinHandle<Result<Vec<u8>, std::io::Error>> {

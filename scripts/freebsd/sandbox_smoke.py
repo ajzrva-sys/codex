@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import pty
 import select
+import shlex
 import signal
 import socket
 import struct
@@ -145,6 +146,36 @@ def main() -> None:
             result.returncode == 0
             and result.stdout.strip() == str(len(payload)).encode(),
         )
+        if Path(client).name != "codex-freebsd-sandbox":
+            contents = bytes(range(256)) * 4096
+            streamed_file = workspace / "stream.bin"
+            streamed_file.write_bytes(contents)
+            for path, readable_stream in [
+                (streamed_file, True),
+                (sibling / "credential", False),
+            ]:
+                result = subprocess.run(
+                    command(shlex.join([client, "--codex-run-as-fs-helper"])),
+                    input=json.dumps(
+                        {"operation": "fs/open", "params": {"path": path.as_uri()}}
+                    ).encode(),
+                    capture_output=True,
+                    timeout=30,
+                )
+                header, separator, body = result.stdout.partition(b"\n")
+                response = json.loads(header)
+                check(
+                    "filesystem helper streams binary data"
+                    if readable_stream
+                    else "filesystem helper stream cannot read credentials",
+                    result.returncode == 0
+                    and separator
+                    and (
+                        response["status"] == "ok" and body == contents
+                        if readable_stream
+                        else response["status"] == "error" and not body
+                    ),
+                )
         (workspace / "hello.c").write_text(
             '#include <stdio.h>\nint main(void) { puts("COMPILED"); return 0; }\n'
         )
