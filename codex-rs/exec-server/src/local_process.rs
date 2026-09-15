@@ -395,6 +395,7 @@ impl LocalProcess {
             SandboxType::None => Some(ProcessSandboxType::None),
             SandboxType::MacosSeatbelt => Some(ProcessSandboxType::MacosSeatbelt),
             SandboxType::LinuxSeccomp => Some(ProcessSandboxType::LinuxSeccomp),
+            SandboxType::FreeBsdJail => Some(ProcessSandboxType::FreeBsdJail),
             SandboxType::WindowsRestrictedToken => Some(ProcessSandboxType::WindowsRestrictedToken),
             SandboxType::WindowsMxc => Some(ProcessSandboxType::WindowsMxc),
         };

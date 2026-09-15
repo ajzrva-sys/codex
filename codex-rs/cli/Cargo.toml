@@ -23,6 +23,7 @@ doctest = false
 workspace = true
 
 [dependencies]
+codex-freebsd-sandbox = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }

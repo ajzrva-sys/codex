@@ -9,6 +9,8 @@ use codex_utils_cli::CliConfigOverrides;
 use codex_utils_cli::ProfileV2Name;
 use std::path::PathBuf;
 
+#[cfg(target_os = "freebsd")]
+pub use debug_sandbox::run_command_under_freebsd;
 pub use debug_sandbox::run_command_under_landlock;
 pub use debug_sandbox::run_command_under_seatbelt;
 pub use debug_sandbox::run_command_under_windows_sandbox;

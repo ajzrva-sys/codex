@@ -44,6 +44,38 @@ fn classifies_legacy_denial_keywords() {
 }
 
 #[test]
+fn freebsd_service_failures_do_not_trigger_unsandboxed_retries() {
+    for message in [
+        "FreeBSD sandbox: service unavailable; execution was blocked",
+        "FreeBSD sandbox: user cannot expose /private: Permission denied",
+        "FreeBSD sandbox: incompatible sandbox protocol",
+    ] {
+        let output = make_exec_output(/*exit_code*/ 125, "", message, message);
+        assert_eq!(
+            classify_filesystem_sandbox_violation(SandboxType::FreeBsdJail, &output),
+            None
+        );
+        assert!(!crate::is_likely_sandbox_denied(
+            SandboxType::FreeBsdJail,
+            &output
+        ));
+        assert!(!crate::denial::is_likely_executor_managed_sandbox_denied(
+            &output
+        ));
+    }
+    let denied = make_exec_output(
+        /*exit_code*/ 1,
+        "",
+        "cat: /private: Permission denied",
+        "",
+    );
+    assert!(crate::is_likely_sandbox_denied(
+        SandboxType::FreeBsdJail,
+        &denied
+    ));
+}
+
+#[test]
 fn normalizes_backend_keywords_as_policy_denied() {
     for keyword in ["seccomp", "sandbox", "landlock"] {
         let output = make_exec_output(/*exit_code*/ 1, "", keyword, "");

@@ -2457,6 +2457,7 @@ dependencies = [
  "codex-apply-patch",
  "codex-async-utils",
  "codex-exec-server",
+ "codex-freebsd-sandbox",
  "codex-install-context",
  "codex-linux-sandbox",
  "codex-sandboxing",
@@ -2607,6 +2608,7 @@ dependencies = [
  "codex-execpolicy",
  "codex-extension-api",
  "codex-features",
+ "codex-freebsd-sandbox",
  "codex-git-attribution",
  "codex-git-utils",
  "codex-history",
@@ -3486,6 +3488,21 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "codex-freebsd-sandbox"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "codex-protocol",
+ "libc",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "signal-hook",
+ "tempfile",
 ]
 
 [[package]]
@@ -4448,6 +4465,7 @@ name = "codex-sandboxing"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "codex-freebsd-sandbox",
  "codex-mxc-sandbox",
  "codex-network-proxy",
  "codex-otel",

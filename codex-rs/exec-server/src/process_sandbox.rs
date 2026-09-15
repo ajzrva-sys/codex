@@ -265,7 +265,7 @@ pub(crate) async fn prepare_exec_request_with_telemetry(
             environment_id: None,
             network: None,
             sandbox_policy_cwd,
-            sandbox_exe: if cfg!(windows) {
+            sandbox_exe: if cfg!(any(windows, target_os = "freebsd")) {
                 Some(runtime_paths.codex_self_exe.as_path())
             } else {
                 runtime_paths.codex_linux_sandbox_exe.as_deref()

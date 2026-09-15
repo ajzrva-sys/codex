@@ -365,6 +365,7 @@ pub enum ProcessSandboxType {
     None,
     MacosSeatbelt,
     LinuxSeccomp,
+    FreeBsdJail,
     WindowsRestrictedToken,
     WindowsMxc,
 }

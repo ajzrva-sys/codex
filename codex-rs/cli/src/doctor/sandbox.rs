@@ -115,6 +115,17 @@ pub(super) fn sandbox_check(config: &Config, arg0_paths: &Arg0DispatchPaths) -> 
         summary = "Linux sandbox helper path does not exist".to_string();
     }
 
+    #[cfg(target_os = "freebsd")]
+    match codex_freebsd_sandbox::status() {
+        Ok(description) => details.push(description),
+        Err(error) => {
+            status = CheckStatus::Warning;
+            summary = "FreeBSD sandbox service is unavailable; sandboxed execution will be blocked"
+                .into();
+            details.push(format!("{error:#}"));
+        }
+    }
+
     let check = DoctorCheck::new("sandbox.helpers", "sandbox", status, summary).details(details);
 
     #[cfg(target_os = "windows")]
