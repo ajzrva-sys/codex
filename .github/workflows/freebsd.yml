@@ -30,7 +30,18 @@ jobs:
             python3 scripts/freebsd/package.py --profile dev
             python3 scripts/freebsd/smoke.py /tmp/codex-target/debug/codex
             python3 scripts/freebsd/smoke.py /tmp/codex-target/debug/codex --code-mode
+            npm install -g dist/freebsd/*.tgz
+            pw useradd codex-test -u 1001 -m -s /bin/sh
+            python3 scripts/freebsd/install_sandbox.py --user codex-test \
+              --daemon /tmp/codex-target/debug/codex-freebsd-sandboxd
+            cp scripts/freebsd/sandbox_smoke.py scripts/freebsd/smoke.py scripts/freebsd/configure_sandbox.py /tmp/
+            su -l codex-test -c 'python3 /tmp/configure_sandbox.py'
+            sandbox_cli="$(npm root -g)/@openai/codex/vendor/x86_64-unknown-freebsd/bin/codex"
+            python3 scripts/freebsd/sandbox_admin_smoke.py --user codex-test --client "$sandbox_cli"
+            su -l codex-test -c "python3 /tmp/smoke.py '$sandbox_cli' --sandbox"
+            su -l codex-test -c "python3 /tmp/smoke.py '$sandbox_cli' --sandbox --code-mode"
             cd codex-rs
+            just test -p codex-freebsd-sandbox -p codex-sandboxing -p codex-exec-server-protocol
             just test -p codex-code-mode-protocol -p codex-file-watcher -p codex-utils-pty
       - name: Upload FreeBSD npm package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

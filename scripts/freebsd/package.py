@@ -21,6 +21,7 @@ def main() -> None:
     parser.add_argument("--version", default="0.0.0-freebsd")
     parser.add_argument("--codex-bin", type=Path)
     parser.add_argument("--code-mode-host-bin", type=Path)
+    parser.add_argument("--sandbox-daemon-bin", type=Path)
     parser.add_argument(
         "--cli-only",
         action="store_true",
@@ -44,8 +45,9 @@ def main() -> None:
     target, cpu = architectures[platform.machine()]
     codex = args.codex_bin
     host = args.code_mode_host_bin
+    daemon = args.sandbox_daemon_bin
     build_host = host is None and not args.cli_only
-    if codex is None or build_host:
+    if codex is None or build_host or daemon is None:
         commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True
         ).strip()
@@ -53,6 +55,10 @@ def main() -> None:
         command = ["cargo", "build", "--locked", "--profile", args.profile]
         if codex is None:
             command.extend(["-p", "codex-cli", "--bin", "codex"])
+        if daemon is None:
+            command.extend(
+                ["-p", "codex-freebsd-sandbox", "--bin", "codex-freebsd-sandboxd"]
+            )
         if build_host:
             env.update(build_v8(REPO_ROOT, args.v8_build_dir))
             env["V8_FROM_SOURCE"] = "0"
@@ -73,6 +79,8 @@ def main() -> None:
             codex = target_dir / profile_dir / "codex"
         if build_host:
             host = target_dir / profile_dir / "codex-code-mode-host"
+        if daemon is None:
+            daemon = target_dir / profile_dir / "codex-freebsd-sandboxd"
     codex = codex.resolve(strict=True)
     subprocess.run([str(codex), "--version"], check=True)
     rg = shutil.which("rg")
@@ -89,6 +97,18 @@ def main() -> None:
         (native / "codex-path").mkdir()
         (native / "codex-resources").mkdir()
         shutil.copy2(codex, native / "bin/codex")
+        # This copy is an installation artifact, never launched by the npm wrapper.
+        # The administrator installs a separate root-owned executable explicitly.
+        shutil.copy2(daemon, native / "bin/codex-freebsd-sandboxd")
+        admin = package / "freebsd"
+        admin.mkdir()
+        for script in [
+            "install_sandbox.py",
+            "configure_sandbox.py",
+            "sandbox_smoke.py",
+            "sandbox_races.py",
+        ]:
+            shutil.copy2(REPO_ROOT / "scripts/freebsd" / script, admin / script)
         shutil.copy2(rg, native / "codex-path/rg")
         if host:
             shutil.copy2(host, native / "bin/codex-code-mode-host")
@@ -115,7 +135,7 @@ def main() -> None:
                 "version": args.version,
                 "os": ["freebsd"],
                 "cpu": [cpu],
-                "files": ["bin/codex.js", "vendor", "README.md", "LICENSE"],
+                "files": ["bin/codex.js", "vendor", "freebsd", "README.md", "LICENSE"],
             }
         )
         (package / "package.json").write_text(json.dumps(metadata, indent=2) + "\n")
