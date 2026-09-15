@@ -9,7 +9,7 @@ permissions:
 jobs:
   freebsd:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Build and test on FreeBSD
@@ -20,15 +20,16 @@ jobs:
           cpu: 4
           prepare: |
             pkg install -y git rust cmake gmake pkgconf protobuf python3 node24 npm \
-              ripgrep bash alsa-lib dbus oniguruma just nextest
+              ripgrep bash alsa-lib dbus oniguruma just nextest gn ninja llvm21 glib
           run: |
             set -eu
-            export CARGO_BUILD_JOBS=2
+            export CARGO_BUILD_JOBS=4
             export CARGO_TARGET_DIR=/tmp/codex-target
             export CARGO_PROFILE_DEV_DEBUG=0
             node --test codex-cli/tests/freebsd-launcher.test.js
             python3 scripts/freebsd/package.py --profile dev
             python3 scripts/freebsd/smoke.py /tmp/codex-target/debug/codex
+            python3 scripts/freebsd/smoke.py /tmp/codex-target/debug/codex --code-mode
             cd codex-rs
             just test -p codex-code-mode-protocol -p codex-file-watcher -p codex-utils-pty
       - name: Upload FreeBSD npm package

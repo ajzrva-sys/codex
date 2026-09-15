@@ -15,6 +15,11 @@ from pathlib import Path
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("codex", type=Path)
+    parser.add_argument(
+        "--code-mode",
+        action="store_true",
+        help="run tools through the native V8 helper",
+    )
     args = parser.parse_args()
     binary = args.codex.resolve(strict=True)
     requests = []
@@ -54,6 +59,14 @@ def main() -> None:
                     "id": "message-done",
                     "content": [{"type": "output_text", "text": "FREEBSD_SMOKE_OK"}],
                 }
+            if args.code_mode and index <= 2:
+                argument = item.get("arguments") or json.dumps(item["input"])
+                item = {
+                    "type": "custom_tool_call",
+                    "call_id": item["call_id"],
+                    "name": "exec",
+                    "input": f"text(await tools.{item['name']}({argument}));",
+                }
             response_id = f"response-{index}"
             events = [
                 {"type": "response.created", "response": {"id": response_id}},
@@ -88,7 +101,7 @@ def main() -> None:
             home.mkdir()
             workspace = root / "workspace"
             workspace.mkdir()
-            (home / "config.toml").write_text(f"""
+            config = f"""
 model = "gpt-5.4"
 model_provider = "local_test"
 check_for_update_on_startup = false
@@ -98,7 +111,10 @@ base_url = "http://127.0.0.1:{server.server_port}/v1"
 wire_api = "responses"
 requires_openai_auth = false
 supports_websockets = false
-""")
+"""
+            if args.code_mode:
+                config += "\n[features]\ncode_mode = true\ncode_mode_only = true\ncode_mode_host = true\n"
+            (home / "config.toml").write_text(config)
             result = subprocess.run(
                 [
                     str(binary),
@@ -114,6 +130,7 @@ supports_websockets = false
                 text=True,
                 capture_output=True,
                 timeout=90,
+                check=False,
             )
             if result.returncode:
                 raise RuntimeError(result.stdout + result.stderr)
@@ -131,14 +148,15 @@ supports_websockets = false
                 item
                 for request in requests[1:]
                 for item in request["input"]
-                if item.get("type") == "function_call_output"
+                if item.get("type")
+                in ("function_call_output", "custom_tool_call_output")
                 and item.get("call_id") == "native-shell"
             ]
             assert any(platform.system() in json.dumps(item) for item in outputs), (
                 outputs
             )
             print(
-                f"PASS: {platform.system()} shell execution, file writes, apply_patch, and Responses round trip"
+                f"PASS: {platform.system()} shell execution, file writes, apply_patch, and Responses round trip (code mode: {args.code_mode})"
             )
     finally:
         server.shutdown()

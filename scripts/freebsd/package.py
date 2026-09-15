@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from build_v8 import build_v8
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -20,6 +21,14 @@ def main() -> None:
     parser.add_argument("--version", default="0.0.0-freebsd")
     parser.add_argument("--codex-bin", type=Path)
     parser.add_argument("--code-mode-host-bin", type=Path)
+    parser.add_argument(
+        "--cli-only",
+        action="store_true",
+        help="omit the V8 helper; requires a model with direct tools",
+    )
+    parser.add_argument(
+        "--v8-build-dir", type=Path, default=REPO_ROOT / "dist/freebsd/v8-build"
+    )
     parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "dist/freebsd")
     args = parser.parse_args()
     if platform.system() != "FreeBSD":
@@ -34,31 +43,36 @@ def main() -> None:
         parser.error(f"unsupported FreeBSD architecture: {platform.machine()}")
     target, cpu = architectures[platform.machine()]
     codex = args.codex_bin
-    if codex is None:
+    host = args.code_mode_host_bin
+    build_host = host is None and not args.cli_only
+    if codex is None or build_host:
         commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True
         ).strip()
+        env = {**os.environ, "STABLE_GIT_COMMIT": commit}
+        command = ["cargo", "build", "--locked", "--profile", args.profile]
+        if codex is None:
+            command.extend(["-p", "codex-cli", "--bin", "codex"])
+        if build_host:
+            env.update(build_v8(REPO_ROOT, args.v8_build_dir))
+            env["V8_FROM_SOURCE"] = "0"
+            command.extend(
+                ["-p", "codex-code-mode-host", "--bin", "codex-code-mode-host"]
+            )
         subprocess.run(
-            [
-                "cargo",
-                "build",
-                "--locked",
-                "--profile",
-                args.profile,
-                "-p",
-                "codex-cli",
-                "--bin",
-                "codex",
-            ],
+            command,
             cwd=REPO_ROOT / "codex-rs",
-            env={**os.environ, "STABLE_GIT_COMMIT": commit},
+            env=env,
             check=True,
         )
         target_dir = Path(os.environ.get("CARGO_TARGET_DIR", "target"))
         if not target_dir.is_absolute():
             target_dir = REPO_ROOT / "codex-rs" / target_dir
         profile_dir = "debug" if args.profile == "dev" else args.profile
-        codex = target_dir / profile_dir / "codex"
+        if codex is None:
+            codex = target_dir / profile_dir / "codex"
+        if build_host:
+            host = target_dir / profile_dir / "codex-code-mode-host"
     codex = codex.resolve(strict=True)
     subprocess.run([str(codex), "--version"], check=True)
     rg = shutil.which("rg")
@@ -76,8 +90,8 @@ def main() -> None:
         (native / "codex-resources").mkdir()
         shutil.copy2(codex, native / "bin/codex")
         shutil.copy2(rg, native / "codex-path/rg")
-        if args.code_mode_host_bin:
-            shutil.copy2(args.code_mode_host_bin, native / "bin/codex-code-mode-host")
+        if host:
+            shutil.copy2(host, native / "bin/codex-code-mode-host")
         for executable in (native / "bin").iterdir():
             subprocess.run(["strip", str(executable)], check=True)
         (native / "codex-package.json").write_text(
