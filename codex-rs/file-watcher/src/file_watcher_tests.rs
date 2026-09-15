@@ -591,3 +591,21 @@ async fn dropping_live_watcher_releases_inner_watcher() {
 
     assert_eq!(weak_inner.upgrade().is_none(), true);
 }
+
+#[cfg(target_os = "freebsd")]
+#[tokio::test]
+async fn freebsd_live_watcher_reports_file_changes() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let file = temp_dir.path().join("config.toml");
+    std::fs::write(&file, "before").expect("create watched file");
+    let watcher = Arc::new(FileWatcher::new().expect("native watcher"));
+    let (subscriber, mut receiver) = watcher.add_subscriber();
+    let _registration = subscriber.register_path(file.clone(), /*recursive*/ false);
+
+    std::fs::write(&file, "after").expect("modify watched file");
+
+    let event = timeout(Duration::from_secs(10), receiver.recv())
+        .await
+        .expect("native file notification timeout");
+    assert_eq!(event, Some(FileWatcherEvent { paths: vec![file] }));
+}

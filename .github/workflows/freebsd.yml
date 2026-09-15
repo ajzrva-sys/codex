@@ -1,0 +1,39 @@
+name: FreeBSD native CLI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  freebsd:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build and test on FreeBSD
+        uses: vmactions/freebsd-vm@8b0f1a8fc0ea0def307835c258940ca358fe6480 # v1
+        with:
+          release: "15.1"
+          mem: 12288
+          cpu: 4
+          prepare: |
+            pkg install -y git rust cmake gmake pkgconf protobuf python3 node24 npm \
+              ripgrep bash alsa-lib dbus oniguruma just nextest
+          run: |
+            set -eu
+            export CARGO_BUILD_JOBS=2
+            export CARGO_TARGET_DIR=/tmp/codex-target
+            export CARGO_PROFILE_DEV_DEBUG=0
+            node --test codex-cli/tests/freebsd-launcher.test.js
+            python3 scripts/freebsd/package.py --profile dev
+            python3 scripts/freebsd/smoke.py /tmp/codex-target/debug/codex
+            cd codex-rs
+            just test -p codex-code-mode-protocol -p codex-file-watcher -p codex-utils-pty
+      - name: Upload FreeBSD npm package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: codex-freebsd-amd64
+          path: dist/freebsd/*.tgz
+          if-no-files-found: error

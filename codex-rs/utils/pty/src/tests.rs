@@ -1174,8 +1174,11 @@ print('__complete__', flush=True)
     session.close_stdin();
 
     let (output, code) = collect_output_until_exit(output_rx, exit_rx, /*timeout_ms*/ 5_000).await;
+    // FreeBSD may ring the terminal bell while the canonical input queue is
+    // full. The child still verifies every input byte before reporting success.
+    let output = String::from_utf8_lossy(&output);
     assert_eq!(
-        (code, String::from_utf8_lossy(&output).trim()),
+        (code, output.trim_start_matches('\u{7}').trim()),
         (0, "__complete__")
     );
     Ok(())
@@ -1343,9 +1346,22 @@ async fn pty_spawn_can_preserve_inherited_fds() -> anyhow::Result<()> {
         write_end.as_raw_fd().to_string(),
     );
 
-    let script = "printf __preserved__ >\"/dev/fd/$PRESERVED_FD\"";
+    let python = find_python().expect("python required for inherited descriptor test");
+    env_map.insert(
+        "UNPRESERVED_FD".to_string(),
+        read_end.as_raw_fd().to_string(),
+    );
+    let script = r"import errno, os
+try:
+    os.fstat(int(os.environ['UNPRESERVED_FD']))
+except OSError as error:
+    assert error.errno == errno.EBADF
+else:
+    raise AssertionError('unrequested descriptor survived exec')
+os.write(int(os.environ['PRESERVED_FD']), b'__preserved__')
+";
     let spawned = spawn_pty_process(
-        "/bin/sh",
+        &python,
         &["-c".to_string(), script.to_string()],
         Path::new("."),
         &env_map,
@@ -1581,9 +1597,22 @@ async fn pipe_spawn_no_stdin_can_preserve_inherited_fds() -> anyhow::Result<()> 
         write_end.as_raw_fd().to_string(),
     );
 
-    let script = "printf __pipe_preserved__ >\"/dev/fd/$PRESERVED_FD\"";
+    let python = find_python().expect("python required for inherited descriptor test");
+    env_map.insert(
+        "UNPRESERVED_FD".to_string(),
+        read_end.as_raw_fd().to_string(),
+    );
+    let script = r"import errno, os
+try:
+    os.fstat(int(os.environ['UNPRESERVED_FD']))
+except OSError as error:
+    assert error.errno == errno.EBADF
+else:
+    raise AssertionError('unrequested descriptor survived exec')
+os.write(int(os.environ['PRESERVED_FD']), b'__pipe_preserved__')
+";
     let spawned = spawn_pipe_process_no_stdin(
-        "/bin/sh",
+        &python,
         &["-c".to_string(), script.to_string()],
         Path::new("."),
         &env_map,
@@ -1602,5 +1631,55 @@ async fn pipe_spawn_no_stdin_can_preserve_inherited_fds() -> anyhow::Result<()> 
     read_end.read_to_string(&mut pipe_output)?;
     assert_eq!(pipe_output, "__pipe_preserved__");
 
+    Ok(())
+}
+
+#[cfg(target_os = "freebsd")]
+#[tokio::test]
+async fn freebsd_default_spawns_do_not_leak_descriptors() -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let file = std::fs::File::open("/dev/null")?;
+    let fd = file.as_raw_fd();
+    // Make this descriptor inheritable so the child cleanup must remove it.
+    assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0);
+    let python = find_python().expect("python required for descriptor cleanup test");
+    let mut env_map: HashMap<String, String> = std::env::vars().collect();
+    env_map.insert("UNPRESERVED_FD".to_string(), fd.to_string());
+    let args = vec![
+        "-c".to_string(),
+        r"import errno, os
+try:
+    os.fstat(int(os.environ['UNPRESERVED_FD']))
+except OSError as error:
+    assert error.errno == errno.EBADF
+else:
+    raise AssertionError('unrequested descriptor survived exec')
+print('__closed__')
+"
+        .to_string(),
+    ];
+    let processes = [
+        spawn_pipe_process_no_stdin(&python, &args, Path::new("."), &env_map, &None, &[]).await?,
+        spawn_pty_process(
+            &python,
+            &args,
+            Path::new("."),
+            &env_map,
+            &None,
+            TerminalSize::default(),
+            &[],
+        )
+        .await?,
+    ];
+    for spawned in processes {
+        let (_session, output_rx, exit_rx) = combine_spawned_output(spawned);
+        let (output, code) =
+            collect_output_until_exit(output_rx, exit_rx, /*timeout_ms*/ 2_000).await;
+        assert_eq!(
+            (code, String::from_utf8_lossy(&output).trim()),
+            (0, "__closed__")
+        );
+    }
     Ok(())
 }

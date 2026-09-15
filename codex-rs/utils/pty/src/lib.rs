@@ -1,3 +1,5 @@
+#[cfg(target_os = "freebsd")]
+mod freebsd;
 pub mod pipe;
 mod process;
 pub mod process_group;
