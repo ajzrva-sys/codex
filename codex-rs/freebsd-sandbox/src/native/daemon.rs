@@ -172,6 +172,21 @@ pub(crate) fn run() -> Result<()> {
                                     },
                                 )?;
                             }
+                            Request::Capabilities { version } => {
+                                ensure!(version == VERSION, "incompatible sandbox protocol");
+                                send(
+                                    &mut stream,
+                                    &Response::Capabilities(crate::protocol::Capabilities {
+                                        version: VERSION,
+                                        service: "codex-freebsd-sandboxd".into(),
+                                        features:
+                                            codex_freebsd_sandbox_client::REQUIRED_CAPABILITIES
+                                                .iter()
+                                                .map(|value| (*value).to_owned())
+                                                .collect(),
+                                    }),
+                                )?;
+                            }
                             Request::Launch(request) => {
                                 job::run(stream.try_clone()?, *request, identity, &state)?
                             }

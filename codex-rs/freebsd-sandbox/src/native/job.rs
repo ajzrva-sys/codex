@@ -31,8 +31,8 @@ pub(super) fn run(
         "invalid sandbox command"
     );
     crate::policy::absolute(&request.cwd)?;
-    let plan =
-        identity.as_user(|| crate::policy::compile(&request.permissions, &request.policy_cwd))?;
+    let permissions = serde_json::from_value(request.permissions.clone())?;
+    let plan = identity.as_user(|| crate::policy::compile(&permissions, &request.policy_cwd))?;
     let mut view = View::new(state, &identity)?;
     view.populate(&plan)?;
     ensure!(

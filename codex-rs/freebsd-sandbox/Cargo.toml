@@ -19,6 +19,7 @@ path = "src/daemon_main.rs"
 workspace = true
 
 [dependencies]
+codex-freebsd-sandbox-client = { workspace = true }
 anyhow = { workspace = true }
 codex-protocol = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

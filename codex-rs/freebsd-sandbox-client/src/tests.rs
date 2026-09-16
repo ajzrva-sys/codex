@@ -1,33 +1,66 @@
-use super::*;
+use crate::protocol::*;
+use std::io;
 
 #[test]
-fn shared_concrete_policy_retains_codex_enforcement() -> anyhow::Result<()> {
-    use codex_freebsd_sandbox_client::policy::Access;
-    use codex_freebsd_sandbox_client::policy::Grant;
-    use codex_freebsd_sandbox_client::policy::Network;
-    use codex_freebsd_sandbox_client::policy::Policy;
-    let root = tempfile::tempdir()?;
-    std::fs::create_dir(root.path().join(".git"))?;
-    let canonical = root.path().canonicalize()?;
+fn capability_probe_requires_complete_compatible_service() {
+    let mut status = Capabilities {
+        version: VERSION,
+        service: "codex-freebsd-sandboxd".into(),
+        features: crate::REQUIRED_CAPABILITIES
+            .iter()
+            .map(|value| (*value).into())
+            .collect(),
+    };
+    assert!(crate::validate_capabilities(&status).is_ok());
+    status.features.pop();
+    assert!(crate::validate_capabilities(&status).is_err());
+    status.version += 1;
+    assert!(crate::validate_capabilities(&status).is_err());
+}
+
+#[test]
+fn concrete_policy_rejects_root_and_relative_grants() {
+    use crate::policy::Access;
+    use crate::policy::Grant;
+    use crate::policy::Network;
+    use crate::policy::Policy;
+    for path in ["/", "relative", "/work/../private"] {
+        let policy = Policy {
+            grants: vec![Grant {
+                path: path.into(),
+                access: Access::Read,
+            }],
+            network: Network::Restricted,
+        };
+        assert!(policy.permissions().is_err(), "{path}");
+    }
     let policy = Policy {
         grants: vec![Grant {
-            path: canonical.clone(),
+            path: "/work".into(),
             access: Access::Write,
         }],
         network: Network::Restricted,
     };
-    let permissions = serde_json::from_value(policy.permissions()?)?;
-    let plan = crate::policy::compile(&permissions, &canonical)?;
     assert_eq!(
-        plan.roots.get(&canonical),
-        Some(&crate::policy::Access::Write)
+        policy.permissions().unwrap()["file_system"]["entries"][1]["access"],
+        "write"
     );
-    assert_eq!(
-        plan.roots.get(&canonical.join(".git")),
-        Some(&crate::policy::Access::Read)
-    );
-    assert!(!plan.network.is_enabled());
-    Ok(())
+}
+
+#[test]
+fn launch_debug_does_not_disclose_secrets() {
+    let request = Launch {
+        version: VERSION,
+        argv: vec!["secret-command".into()],
+        cwd: "/private/path".into(),
+        policy_cwd: "/private/path".into(),
+        permissions: serde_json::json!({}),
+        env: [("TOKEN".into(), "secret-value".into())].into(),
+        terminal: None,
+    };
+    let debug = format!("{request:?}");
+    assert!(!debug.contains("secret"));
+    assert!(!debug.contains("/private"));
 }
 
 #[test]

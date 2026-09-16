@@ -172,7 +172,7 @@ pub(super) fn run(
                             view.stop()?;
                         }
                     }
-                    Request::Launch(_) | Request::Probe { .. } => {
+                    Request::Launch(_) | Request::Probe { .. } | Request::Capabilities { .. } => {
                         anyhow::bail!("unexpected sandbox request")
                     }
                 }
