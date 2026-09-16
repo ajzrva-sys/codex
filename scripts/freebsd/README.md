@@ -1,6 +1,6 @@
 # Native FreeBSD build
 
-This branch builds the Codex CLI natively on FreeBSD and packages it with the
+This fork builds the Codex CLI natively on FreeBSD and packages it with the
 npm launcher. It does not require Linux compatibility. FreeBSD 15.1 amd64 is
 tested with Rust 1.96.1; arm64 launcher selection has tests but needs native testing.
 
@@ -20,7 +20,7 @@ on FreeBSD, or the executable specified by `PROTOC`.
 Build as your regular user:
 
 ```sh
-git clone -b freebsd-support https://github.com/ajzrva-sys/codex.git
+git clone -b main https://github.com/ajzrva-sys/codex.git
 cd codex
 python3 scripts/freebsd/package.py
 ```
@@ -41,7 +41,7 @@ The tarball includes the native CLI, code-mode helper, sandbox daemon, administr
 and the patched npm launcher.
 It is self-contained with respect to npm dependencies. The official npm
 registry package does not yet distribute a FreeBSD binary; reinstalling that
-package will not install this branch's build.
+package will not install this fork's build.
 
 ## Run as your regular user
 
