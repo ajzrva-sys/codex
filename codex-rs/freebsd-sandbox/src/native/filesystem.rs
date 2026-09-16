@@ -9,7 +9,9 @@ use anyhow::ensure;
 use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
+use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -60,6 +62,14 @@ impl View {
 
     pub fn populate(&mut self, plan: &Plan) -> Result<()> {
         let _mount_guard = sys::mount_guard()?;
+        let manifest_path = Path::new("/.codex-sandbox-sources.json");
+        ensure!(
+            !plan
+                .roots
+                .keys()
+                .any(|path| path.starts_with(manifest_path) || manifest_path.starts_with(path)),
+            "sandbox source identity record is reserved"
+        );
         // Pin sources with the peer's credentials before creating any views.
         let mut sources: Vec<file_views::Source> = Vec::new();
         for (path, access) in &plan.roots {
@@ -130,6 +140,21 @@ impl View {
             };
             sources.push((path.clone(), *access, source));
         }
+        // Record original descriptors before projections or nullfs replace
+        // their filesystem identities. Workers can bind an approved host
+        // identity to the mounted object without reopening the host path.
+        let mut identities = BTreeMap::new();
+        for (path, _, source) in &sources {
+            if let Some(source) = source {
+                let metadata = source.metadata()?;
+                identities.insert(path.clone(), (metadata.dev(), metadata.ino()));
+            }
+        }
+        let manifest = serde_json::to_vec(&(1u32, identities))?;
+        ensure!(
+            manifest.len() <= 1024 * 1024,
+            "source identity record too large"
+        );
         sources.sort_by_key(|(path, _, _)| path.components().count());
         for (path, access, source) in &sources {
             if *access == Access::Read
@@ -315,6 +340,13 @@ impl View {
             &[("ruleset", DEVICE_RULESET.to_string())],
             libc::MNT_NOSUID,
         )?;
+        let manifest_destination = self.root.join(manifest_path.strip_prefix("/")?);
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&manifest_destination)?;
+        file.set_permissions(fs::Permissions::from_mode(0o444))?;
+        file.write_all(&manifest)?;
         // Synthetic parents are root-owned and not writable by the workload.
         // Runtime and protected source views additionally use read-only mounts.
         Ok(())

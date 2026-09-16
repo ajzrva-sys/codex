@@ -116,6 +116,19 @@ def main() -> None:
 
             return run("/usr/local/bin/python3 -c " + shlex.quote(code), permissions)
 
+        host_identity = workspace.stat()
+        record = python("import json; print(json.dumps(json.load(open('/.codex-sandbox-sources.json'))))")
+        identities = json.loads(record.stdout)
+        check("pinned source identity survives nullfs", record.returncode == 0
+              and identities[0] == 1
+              and identities[1][str(workspace)] == [host_identity.st_dev, host_identity.st_ino])
+        check("source identity record cannot be modified",
+              run("printf forged > /.codex-sandbox-sources.json").returncode != 0)
+        reserved = subprocess.run(command("touch should-not-run", profile(workspace,
+            [entry(Path("/.codex-sandbox-sources.json"), "write")])), capture_output=True)
+        check("source identity mount substitution rejected", reserved.returncode == 125
+              and not (workspace / "should-not-run").exists())
+
         result = run(
             'test "$(id -u)" = "'
             + str(os.getuid())
@@ -498,9 +511,12 @@ def main() -> None:
                         input_sent = True
                 if process.poll() is not None and not ready:
                     break
+            terminal_status = process.wait(timeout=5)
+            if terminal_status != 0 or b"READ:hello" not in output or b"42 91" not in output:
+                print(f"PTY diagnostic: exit={terminal_status}, output={bytes(output)!r}", flush=True)
             check(
                 "dedicated PTY input and resizing",
-                process.wait(timeout=5) == 0
+                terminal_status == 0
                 and b"READ:hello" in output
                 and b"42 91" in output,
             )

@@ -183,6 +183,9 @@ pub(crate) fn run() -> Result<()> {
                                             codex_freebsd_sandbox_client::REQUIRED_CAPABILITIES
                                                 .iter()
                                                 .map(|value| (*value).to_owned())
+                                                .chain(std::iter::once(
+                                                    "source-identities-v1".into(),
+                                                ))
                                                 .collect(),
                                     }),
                                 )?;
