@@ -42,6 +42,7 @@ pub enum SandboxType {
     None,
     MacosSeatbelt,
     LinuxSeccomp,
+    FreeBsdJail,
     WindowsRestrictedToken,
     WindowsMxc,
 }
@@ -52,6 +53,7 @@ impl SandboxType {
             SandboxType::None => "none",
             SandboxType::MacosSeatbelt => "seatbelt",
             SandboxType::LinuxSeccomp => "seccomp",
+            SandboxType::FreeBsdJail => "freebsd_jail",
             SandboxType::WindowsRestrictedToken => "windows_sandbox",
             SandboxType::WindowsMxc => "windows_mxc",
         }
@@ -68,6 +70,8 @@ pub enum SandboxablePreference {
 pub fn get_platform_sandbox(windows_sandbox_enabled: bool) -> Option<SandboxType> {
     if cfg!(target_os = "macos") {
         Some(SandboxType::MacosSeatbelt)
+    } else if cfg!(target_os = "freebsd") {
+        Some(SandboxType::FreeBsdJail)
     } else if cfg!(target_os = "linux") {
         Some(SandboxType::LinuxSeccomp)
     } else if cfg!(target_os = "windows") {
@@ -216,6 +220,7 @@ pub enum SandboxTransformError {
         source: io::Error,
     },
     MissingLinuxSandboxExecutable,
+    FreeBsdPreparation(String),
     WindowsMxcPreparation(String),
     EnvironmentNetworkProxy(String),
     #[cfg(target_os = "macos")]
@@ -241,6 +246,7 @@ impl std::fmt::Display for SandboxTransformError {
                 f,
                 "sandbox policy cwd URI `{cwd}` is not valid on this host: {source}"
             ),
+            Self::FreeBsdPreparation(message) => write!(f, "FreeBSD sandbox: {message}"),
             Self::MissingLinuxSandboxExecutable => {
                 write!(f, "missing codex-linux-sandbox executable path")
             }
@@ -272,6 +278,7 @@ impl std::error::Error for SandboxTransformError {
             Self::InvalidCommandCwd { source, .. }
             | Self::InvalidSandboxPolicyCwd { source, .. } => Some(source),
             Self::MissingLinuxSandboxExecutable => None,
+            Self::FreeBsdPreparation(_) => None,
             Self::WindowsMxcPreparation(_) => None,
             Self::EnvironmentNetworkProxy(_) => None,
             #[cfg(target_os = "macos")]
@@ -488,6 +495,33 @@ impl SandboxManager {
             }
             #[cfg(not(target_os = "macos"))]
             SandboxType::MacosSeatbelt => return Err(SandboxTransformError::SeatbeltUnavailable),
+            SandboxType::FreeBsdJail => {
+                if !cfg!(target_os = "freebsd") {
+                    return Err(SandboxTransformError::FreeBsdPreparation(
+                        "FreeBSD jails require FreeBSD".into(),
+                    ));
+                }
+                if enforce_managed_network || command.managed_network.is_some() {
+                    return Err(SandboxTransformError::FreeBsdPreparation(
+                        "managed proxy policies are not supported; execution was blocked".into(),
+                    ));
+                }
+                let pending = pending_sandboxed_request?;
+                let exe = sandbox_exe
+                    .map(std::path::Path::to_path_buf)
+                    .map_or_else(std::env::current_exe, Ok)
+                    .map_err(|err| SandboxTransformError::FreeBsdPreparation(err.to_string()))?;
+                let args = codex_freebsd_sandbox::command_args(
+                    argv,
+                    pending.native_command_cwd.as_path(),
+                    pending.native_sandbox_policy_cwd.as_path(),
+                    &pending.effective_permission_profile,
+                )
+                .map_err(|err| SandboxTransformError::FreeBsdPreparation(err.to_string()))?;
+                let mut command = vec![os_string_to_command_component(exe.into_os_string())];
+                command.extend(args);
+                (command, None, Some(pending))
+            }
             SandboxType::LinuxSeccomp => {
                 let pending = pending_sandboxed_request?;
                 let exe =

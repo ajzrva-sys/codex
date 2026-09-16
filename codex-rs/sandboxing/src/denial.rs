@@ -43,7 +43,7 @@ pub fn is_likely_sandbox_denied(
 
 /// Detect executor-managed sandbox denials when its concrete backend is unknown.
 pub fn is_likely_executor_managed_sandbox_denied(exec_output: &ExecToolCallOutput) -> bool {
-    if exec_output.exit_code == 0 {
+    if exec_output.exit_code == 0 || is_freebsd_service_failure(exec_output) {
         return false;
     }
 
@@ -69,4 +69,20 @@ pub fn is_likely_executor_managed_sandbox_denied(exec_output: &ExecToolCallOutpu
             .iter()
             .any(|needle| lower.contains(needle))
     })
+}
+
+/// Service/setup failures must never enter the sandbox-denial retry path,
+/// including when a remote executor's backend is unknown to the caller.
+pub(crate) fn is_freebsd_service_failure(output: &ExecToolCallOutput) -> bool {
+    output.exit_code == 125
+        && [
+            &output.stderr.text,
+            &output.stdout.text,
+            &output.aggregated_output.text,
+        ]
+        .into_iter()
+        .any(|text| {
+            text.lines()
+                .any(|line| line.starts_with("FreeBSD sandbox:"))
+        })
 }

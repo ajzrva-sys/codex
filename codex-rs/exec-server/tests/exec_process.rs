@@ -1314,6 +1314,7 @@ async fn assert_remote_windows_sandbox_process_write(
             sandbox.windows_sandbox_selection = WindowsSandboxSelection::Mxc;
         }
         codex_sandboxing::SandboxType::None
+        | codex_sandboxing::SandboxType::FreeBsdJail
         | codex_sandboxing::SandboxType::MacosSeatbelt
         | codex_sandboxing::SandboxType::LinuxSeccomp => {
             anyhow::bail!("expected a Windows sandbox type")

@@ -812,3 +812,58 @@ fn transform_for_direct_spawn_windows_materializes_inner_helper() {
     );
     assert!(materialized_helper.exists());
 }
+
+#[cfg(target_os = "freebsd")]
+#[test]
+fn freebsd_transform_wraps_commands_and_rejects_managed_proxies() -> anyhow::Result<()> {
+    let root = TempDir::new()?;
+    let root = AbsolutePathBuf::from_absolute_path(root.path())?;
+    let cwd = PathUri::from_abs_path(&root);
+    let permissions = PermissionProfile::from_runtime_permissions(
+        &FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry::new(
+            FileSystemPath::Path {
+                path: PathUri::from_abs_path(&root),
+            },
+            FileSystemAccessMode::Write,
+        )]),
+        NetworkSandboxPolicy::Restricted,
+    );
+    for managed in [false, true] {
+        let result = SandboxManager::new().transform(SandboxTransformRequest {
+            command: SandboxCommand {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "printf sandboxed".into()],
+                cwd: cwd.clone(),
+                env: HashMap::new(),
+                managed_network: None,
+                additional_permissions: None,
+            },
+            permissions: &permissions,
+            sandbox: SandboxType::FreeBsdJail,
+            enforce_managed_network: managed,
+            environment_id: None,
+            network: None,
+            sandbox_policy_cwd: &cwd,
+            sandbox_exe: Some(std::path::Path::new("/usr/local/bin/codex")),
+            use_legacy_landlock: false,
+            windows_sandbox_level: WindowsSandboxLevel::Disabled,
+            windows_sandbox_private_desktop: false,
+        });
+        if managed {
+            assert!(
+                matches!(result, Err(super::SandboxTransformError::FreeBsdPreparation(message)) if message.contains("managed proxy"))
+            );
+        } else {
+            let request = result?;
+            assert_eq!(
+                &request.command[..2],
+                &["/usr/local/bin/codex", codex_freebsd_sandbox::CLIENT_ARG]
+            );
+            assert_eq!(
+                &request.command[request.command.len() - 4..],
+                &["--", "/bin/sh", "-c", "printf sandboxed"]
+            );
+        }
+    }
+    Ok(())
+}

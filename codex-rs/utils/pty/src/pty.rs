@@ -142,7 +142,9 @@ pub async fn spawn_process(
     let _ = inherited_fds;
 
     #[cfg(unix)]
-    if !inherited_fds.is_empty() {
+    if cfg!(target_os = "freebsd") || !inherited_fds.is_empty() {
+        // portable-pty relies on a complete /dev/fd listing for fd cleanup,
+        // which FreeBSD only provides when fdescfs is separately mounted.
         return spawn_process_preserving_fds(program, args, cwd, env, arg0, size, inherited_fds)
             .await;
     }
@@ -318,6 +320,11 @@ async fn spawn_process_preserving_fds(
     let stdin = slave.try_clone()?;
     let stdout = slave.try_clone()?;
     let stderr = slave.try_clone()?;
+    let stdin_close_behavior = if inherited_fds.is_empty() {
+        crate::unix_io::StdinCloseBehavior::SendEof
+    } else {
+        crate::unix_io::StdinCloseBehavior::NoEof
+    };
     let inherited_fds = inherited_fds.to_vec();
 
     unsafe {
@@ -352,6 +359,9 @@ async fn spawn_process_preserving_fds(
                     return Err(std::io::Error::last_os_error());
                 }
 
+                #[cfg(target_os = "freebsd")]
+                crate::freebsd::set_cloexec_except(&inherited_fds)?;
+                #[cfg(not(target_os = "freebsd"))]
                 close_inherited_fds_except(&inherited_fds);
                 Ok(())
             });
@@ -364,11 +374,7 @@ async fn spawn_process_preserving_fds(
     let (writer_tx, writer_rx) = mpsc::channel::<Vec<u8>>(128);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
     let (_stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(1);
-    let (reader_handle, writer_handle) = io.spawn(
-        stdout_tx,
-        writer_rx,
-        crate::unix_io::StdinCloseBehavior::NoEof,
-    );
+    let (reader_handle, writer_handle) = io.spawn(stdout_tx, writer_rx, stdin_close_behavior);
 
     let (exit_tx, exit_rx) = oneshot::channel::<i32>();
     let exit_status = Arc::new(AtomicBool::new(false));
@@ -531,7 +537,7 @@ pub fn close_inherited_fds_except(preserved_fds: &[RawFd]) {
 }
 
 // Other Unix platforms keep their existing fd cleanup.
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "freebsd"))))]
 pub(crate) fn close_inherited_fds_except(preserved_fds: &[RawFd]) {
     if let Ok(dir) = std::fs::read_dir("/dev/fd") {
         let mut fds = Vec::new();

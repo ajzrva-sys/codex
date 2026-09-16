@@ -1,0 +1,51 @@
+name: FreeBSD native CLI
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  freebsd:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build and test on FreeBSD
+        uses: vmactions/freebsd-vm@8b0f1a8fc0ea0def307835c258940ca358fe6480 # v1
+        with:
+          release: "15.1"
+          mem: 12288
+          cpu: 4
+          prepare: |
+            pkg install -y git rust cmake gmake pkgconf protobuf python3 node24 npm \
+              ripgrep bash alsa-lib dbus oniguruma just nextest gn ninja llvm21 glib
+          run: |
+            set -eu
+            export CARGO_BUILD_JOBS=4
+            export CARGO_TARGET_DIR=/tmp/codex-target
+            export CARGO_PROFILE_DEV_DEBUG=0
+            node --test codex-cli/tests/freebsd-launcher.test.js
+            python3 scripts/freebsd/package.py --profile dev
+            python3 scripts/freebsd/smoke.py /tmp/codex-target/debug/codex
+            python3 scripts/freebsd/smoke.py /tmp/codex-target/debug/codex --code-mode
+            npm install -g dist/freebsd/*.tgz
+            pw useradd codex-test -u 1001 -m -s /bin/sh
+            python3 scripts/freebsd/install_sandbox.py --user codex-test \
+              --daemon /tmp/codex-target/debug/codex-freebsd-sandboxd
+            cp scripts/freebsd/sandbox_smoke.py scripts/freebsd/smoke.py scripts/freebsd/configure_sandbox.py /tmp/
+            su -l codex-test -c 'python3 /tmp/configure_sandbox.py'
+            sandbox_cli="$(npm root -g)/@openai/codex/vendor/x86_64-unknown-freebsd/bin/codex"
+            python3 scripts/freebsd/sandbox_admin_smoke.py --user codex-test --client "$sandbox_cli"
+            su -l codex-test -c "python3 /tmp/smoke.py '$sandbox_cli' --sandbox"
+            su -l codex-test -c "python3 /tmp/smoke.py '$sandbox_cli' --sandbox --code-mode"
+            cd codex-rs
+            just test -p codex-freebsd-sandbox -p codex-sandboxing -p codex-exec-server-protocol
+            just test -p codex-code-mode-protocol -p codex-file-watcher -p codex-utils-pty
+      - name: Upload FreeBSD npm package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: codex-freebsd-amd64
+          path: dist/freebsd/*.tgz
+          if-no-files-found: error

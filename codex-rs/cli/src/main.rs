@@ -460,13 +460,25 @@ impl clap::FromArgMatches for SessionTuiCli {
 type HostSandboxArgs = codex_cli::SeatbeltCommand;
 #[cfg(target_os = "linux")]
 type HostSandboxArgs = codex_cli::LandlockCommand;
+#[cfg(target_os = "freebsd")]
+type HostSandboxArgs = codex_cli::LandlockCommand;
 #[cfg(target_os = "windows")]
 type HostSandboxArgs = codex_cli::WindowsCommand;
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "windows",
+    target_os = "freebsd"
+)))]
 type HostSandboxArgs = UnsupportedSandboxArgs;
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "windows",
+    target_os = "freebsd"
+)))]
 #[derive(Debug, Parser)]
 struct UnsupportedSandboxArgs {
     /// Layer $CODEX_HOME/<name>.config.toml on top of the base user config.
@@ -1790,6 +1802,13 @@ async fn cli_main(
                 loader_overrides,
             )
             .await?;
+            #[cfg(target_os = "freebsd")]
+            codex_cli::run_command_under_freebsd(
+                sandbox_cli,
+                arg0_paths.codex_linux_sandbox_exe.clone(),
+                loader_overrides,
+            )
+            .await?;
             #[cfg(target_os = "windows")]
             codex_cli::run_command_under_windows_sandbox(
                 sandbox_cli,
@@ -1797,7 +1816,12 @@ async fn cli_main(
                 loader_overrides,
             )
             .await?;
-            #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+            #[cfg(not(any(
+                target_os = "macos",
+                target_os = "linux",
+                target_os = "windows",
+                target_os = "freebsd"
+            )))]
             {
                 let _ = loader_overrides;
                 anyhow::bail!("`codex sandbox` is not supported on this operating system");

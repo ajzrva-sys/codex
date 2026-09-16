@@ -92,10 +92,34 @@ pub async fn run_command_under_seatbelt(
     anyhow::bail!("Seatbelt sandbox is only available on macOS");
 }
 
+#[cfg(target_os = "freebsd")]
+pub async fn run_command_under_freebsd(
+    command: LandlockCommand,
+    sandbox_exe: Option<PathBuf>,
+    loader_overrides: LoaderOverrides,
+) -> anyhow::Result<()> {
+    run_command_under_profile(command, sandbox_exe, loader_overrides, SandboxType::Freebsd).await
+}
+
 pub async fn run_command_under_landlock(
     command: LandlockCommand,
     codex_linux_sandbox_exe: Option<PathBuf>,
     loader_overrides: LoaderOverrides,
+) -> anyhow::Result<()> {
+    run_command_under_profile(
+        command,
+        codex_linux_sandbox_exe,
+        loader_overrides,
+        SandboxType::Landlock,
+    )
+    .await
+}
+
+async fn run_command_under_profile(
+    command: LandlockCommand,
+    codex_linux_sandbox_exe: Option<PathBuf>,
+    loader_overrides: LoaderOverrides,
+    sandbox_type: SandboxType,
 ) -> anyhow::Result<()> {
     let LandlockCommand {
         sandbox_state,
@@ -121,7 +145,7 @@ pub async fn run_command_under_landlock(
         command,
         config_overrides,
         codex_linux_sandbox_exe,
-        SandboxType::Landlock,
+        sandbox_type,
         /*log_denials*/ false,
         &[],
     )
@@ -168,6 +192,8 @@ enum SandboxType {
     #[cfg(target_os = "macos")]
     Seatbelt,
     Landlock,
+    #[cfg(target_os = "freebsd")]
+    Freebsd,
     Windows,
 }
 
@@ -419,6 +445,29 @@ async fn run_command_under_sandbox(
                         network.apply_to_env(env_map);
                     }
                 },
+            )
+            .await?
+        }
+        #[cfg(target_os = "freebsd")]
+        SandboxType::Freebsd => {
+            anyhow::ensure!(
+                network.is_none(),
+                "FreeBSD sandbox does not support managed proxy policies"
+            );
+            let args = codex_freebsd_sandbox::command_args(
+                command,
+                cwd.as_path(),
+                sandbox_policy_cwd.as_path(),
+                &runtime_permission_profile,
+            )?;
+            spawn_debug_sandbox_child(
+                std::env::current_exe()?,
+                args,
+                /*arg0*/ None,
+                cwd.to_path_buf(),
+                runtime_permission_profile.network_sandbox_policy(),
+                env,
+                |_| {},
             )
             .await?
         }

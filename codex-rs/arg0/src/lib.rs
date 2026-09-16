@@ -107,6 +107,9 @@ pub fn arg0_dispatch() -> Option<Arg0PathEntryGuard> {
     if argv1 == CODEX_ARG0_EXEC_HELPER_ARG1 {
         codex_exec_server::run_arg0_exec_helper_main();
     }
+    if argv1 == codex_freebsd_sandbox::CLIENT_ARG {
+        codex_freebsd_sandbox::run_client();
+    }
     if argv1 == CODEX_FS_HELPER_ARG1 {
         codex_exec_server::run_fs_helper_main();
     }

@@ -47,6 +47,7 @@ pub enum SandboxViolationEvent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SandboxViolationBackend {
     LinuxSandbox,
+    FreeBsdJail,
     ManagedNetworkProxy,
     Seatbelt,
     WindowsSandbox,
@@ -57,6 +58,7 @@ impl SandboxViolationBackend {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::LinuxSandbox => "linux_sandbox",
+            Self::FreeBsdJail => "freebsd_jail",
             Self::ManagedNetworkProxy => "managed_network_proxy",
             Self::Seatbelt => "seatbelt",
             Self::WindowsSandbox => "windows_sandbox",
@@ -137,13 +139,14 @@ fn classify_filesystem_sandbox_violation(
     sandbox_type: SandboxType,
     exec_output: &ExecToolCallOutput,
 ) -> Option<FileSystemSandboxViolation> {
-    if exec_output.exit_code == 0 {
+    if exec_output.exit_code == 0 || crate::denial::is_freebsd_service_failure(exec_output) {
         return None;
     }
     let backend = match sandbox_type {
         SandboxType::None => return None,
         SandboxType::MacosSeatbelt => SandboxViolationBackend::Seatbelt,
         SandboxType::LinuxSeccomp => SandboxViolationBackend::LinuxSandbox,
+        SandboxType::FreeBsdJail => SandboxViolationBackend::FreeBsdJail,
         SandboxType::WindowsRestrictedToken => SandboxViolationBackend::WindowsSandbox,
         SandboxType::WindowsMxc => SandboxViolationBackend::WindowsMxc,
     };

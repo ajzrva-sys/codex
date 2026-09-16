@@ -1,6 +1,7 @@
 use codex_exec_server_protocol::JSONRPCErrorError;
 use codex_sandboxing::SandboxExecRequest;
 use codex_utils_path_uri::PathUri;
+#[cfg(not(target_os = "freebsd"))]
 use tokio::io;
 
 use crate::fs_helper::FsHelperOpenResponse;
@@ -9,17 +10,25 @@ use crate::fs_helper::FsHelperRequest;
 use crate::fs_helper::FsHelperResponse;
 #[cfg(windows)]
 use crate::fs_sandbox::drain_helper_stderr;
+#[cfg(not(target_os = "freebsd"))]
 use crate::fs_sandbox::io_error;
 #[cfg(windows)]
 use crate::fs_sandbox::read_helper_response;
 #[cfg(windows)]
 use crate::fs_sandbox::reap_helper_after_response;
+#[cfg(not(target_os = "freebsd"))]
 use crate::fs_sandbox::spawn_command;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "freebsd")))]
 use crate::fs_sandbox::wait_for_helper_output;
 use crate::protocol::FsReadFileParams;
 use crate::rpc::internal_error;
 use crate::rpc::invalid_request;
+
+#[cfg(any(target_os = "freebsd", all(test, unix)))]
+#[path = "sandboxed_file_open_freebsd.rs"]
+mod streamed;
+#[cfg(target_os = "freebsd")]
+use streamed::open as open_platform;
 
 pub(crate) async fn open(
     command: SandboxExecRequest,
@@ -47,7 +56,7 @@ fn open_response(response: &[u8]) -> Result<FsHelperOpenResponse, JSONRPCErrorEr
 }
 
 // Unix passes the opened fd over the helper's stdin socket.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "freebsd")))]
 async fn open_platform(
     command: SandboxExecRequest,
     request: Vec<u8>,
@@ -104,7 +113,7 @@ async fn open_platform(
 }
 
 // SCM_RIGHTS is Unix-only.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "freebsd")))]
 pub(crate) fn transfer_file(file: &tokio::fs::File) -> io::Result<()> {
     use rustix::net::SendAncillaryBuffer;
     use rustix::net::SendAncillaryMessage;
@@ -133,7 +142,7 @@ pub(crate) fn transfer_file(file: &tokio::fs::File) -> io::Result<()> {
 }
 
 // File-descriptor passing is only available on Unix.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "freebsd")))]
 fn receive_file_descriptor(
     socket: &std::os::unix::net::UnixStream,
 ) -> io::Result<std::os::fd::OwnedFd> {

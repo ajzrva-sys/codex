@@ -18,12 +18,12 @@ use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxTransformRequest;
 use codex_sandboxing::SandboxType;
 use codex_utils_absolute_path::AbsolutePathBuf;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 use codex_utils_absolute_path::canonicalize_preserving_symlinks;
 use codex_utils_path_uri::PathUri;
 #[cfg(any(windows, test))]
 use tokio::io::AsyncBufReadExt;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "freebsd", test))]
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -41,7 +41,7 @@ use crate::rpc::invalid_request;
 const FS_HELPER_ENV_ALLOWLIST: &[&str] = &["PATH", "TMPDIR", "TMP", "TEMP"];
 #[cfg(any(windows, test))]
 const FS_HELPER_EXIT_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 2);
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "freebsd", test))]
 const MAX_FS_HELPER_STDERR_BYTES: u64 = 4096;
 #[cfg(debug_assertions)]
 const FS_HELPER_BAZEL_BWRAP_ENV_ALLOWLIST: &[&str] = &[
@@ -118,9 +118,9 @@ impl FileSystemSandboxRunner {
             &helper_read_roots,
             cwd.native.as_path(),
         );
-        // Linux resolves aliases in the sandbox helper. Doing it here also probes
-        // unrelated permission roots synchronously on the executor's runtime thread.
-        #[cfg(not(target_os = "linux"))]
+        // Linux and FreeBSD resolve paths in the sandbox backend. Keep mutable
+        // components intact until that backend binds the filesystem view.
+        #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
         normalize_file_system_policy_root_aliases(&mut file_system_policy);
         let network_policy = NetworkSandboxPolicy::Restricted;
         let permission_profile = PermissionProfile::from_runtime_permissions_with_enforcement(
@@ -176,7 +176,7 @@ impl FileSystemSandboxRunner {
                     environment_id: None,
                     network: None,
                     sandbox_policy_cwd: &cwd.uri,
-                    sandbox_exe: if cfg!(windows) {
+                    sandbox_exe: if cfg!(any(windows, target_os = "freebsd")) {
                         Some(self.runtime_paths.codex_self_exe.as_path())
                     } else {
                         self.runtime_paths.codex_linux_sandbox_exe.as_deref()
@@ -264,7 +264,7 @@ fn add_helper_runtime_permissions(
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 fn normalize_file_system_policy_root_aliases(file_system_policy: &mut FileSystemSandboxPolicy) {
     for entry in &mut file_system_policy.entries {
         // Alias normalization uses this executor's filesystem; leave foreign
@@ -277,7 +277,7 @@ fn normalize_file_system_policy_root_aliases(file_system_policy: &mut FileSystem
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
 fn normalize_top_level_alias(path: AbsolutePathBuf) -> AbsolutePathBuf {
     let raw_path = path.to_path_buf();
     for ancestor in raw_path.ancestors() {
@@ -398,7 +398,7 @@ pub(crate) async fn read_helper_response(
     Ok(response)
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, target_os = "freebsd", test))]
 pub(crate) fn drain_helper_stderr(
     child: &mut tokio::process::Child,
 ) -> tokio::task::JoinHandle<Result<Vec<u8>, std::io::Error>> {

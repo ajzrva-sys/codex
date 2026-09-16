@@ -74,6 +74,9 @@ impl From<SandboxTransformError> for CodexErr {
             SandboxTransformError::EnvironmentNetworkProxy(message) => {
                 CodexErr::UnsupportedOperation(message)
             }
+            SandboxTransformError::FreeBsdPreparation(message) => {
+                CodexErr::UnsupportedOperation(message)
+            }
             SandboxTransformError::WindowsMxcPreparation(message) => {
                 CodexErr::UnsupportedOperation(message)
             }

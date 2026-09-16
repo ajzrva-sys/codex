@@ -68,6 +68,9 @@ uuid = { workspace = true, features = ["v4"] }
 libc = { workspace = true }
 rustix = { workspace = true, features = ["fs"] }
 
+[target.'cfg(target_os = "freebsd")'.dependencies]
+tempfile = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",

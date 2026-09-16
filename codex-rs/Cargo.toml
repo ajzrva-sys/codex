@@ -76,6 +76,7 @@ members = [
     "keyring-store",
     "file-search",
     "file-watcher",
+    "freebsd-sandbox",
     "linux-sandbox",
     "lmstudio",
     "login",
@@ -231,6 +232,7 @@ codex-hooks = { path = "hooks" }
 codex-history = { path = "history" }
 codex-keyring-store = { path = "keyring-store" }
 codex-linux-sandbox = { path = "linux-sandbox" }
+codex-freebsd-sandbox = { path = "freebsd-sandbox" }
 codex-lmstudio = { path = "lmstudio" }
 codex-login = { path = "login" }
 codex-message-history = { path = "message-history" }

@@ -367,7 +367,10 @@ async fn file_system_remote_fs_helper_respects_windows_sandbox_write_policy(
         SandboxType::WindowsMxc => {
             sandbox.windows_sandbox_selection = WindowsSandboxSelection::Mxc;
         }
-        SandboxType::None | SandboxType::MacosSeatbelt | SandboxType::LinuxSeccomp => {
+        SandboxType::None
+        | SandboxType::FreeBsdJail
+        | SandboxType::MacosSeatbelt
+        | SandboxType::LinuxSeccomp => {
             anyhow::bail!("expected a Windows sandbox type")
         }
     }

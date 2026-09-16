@@ -20,6 +20,8 @@ const PLATFORM_PACKAGE_BY_TARGET = {
   "aarch64-apple-darwin": "@openai/codex-darwin-arm64",
   "x86_64-pc-windows-msvc": "@openai/codex-win32-x64",
   "aarch64-pc-windows-msvc": "@openai/codex-win32-arm64",
+  "x86_64-unknown-freebsd": "@openai/codex-freebsd-x64",
+  "aarch64-unknown-freebsd": "@openai/codex-freebsd-arm64",
 };
 
 const { platform, arch } = process;
@@ -46,6 +48,18 @@ switch (platform) {
         break;
       case "arm64":
         targetTriple = "aarch64-apple-darwin";
+        break;
+      default:
+        break;
+    }
+    break;
+  case "freebsd":
+    switch (arch) {
+      case "x64":
+        targetTriple = "x86_64-unknown-freebsd";
+        break;
+      case "arm64":
+        targetTriple = "aarch64-unknown-freebsd";
         break;
       default:
         break;
@@ -93,6 +107,13 @@ function findCodexExecutable() {
   );
   if (existsSync(codexExecutable)) {
     return codexExecutable;
+  }
+
+  if (platform === "freebsd") {
+    throw new Error(
+      `Missing native FreeBSD binary: ${codexExecutable}. ` +
+        "Install a FreeBSD build of Codex; see scripts/freebsd/README.md in the source repository.",
+    );
   }
 
   const packageManager = detectPackageManager();

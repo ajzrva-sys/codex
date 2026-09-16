@@ -13,6 +13,7 @@ doctest = false
 workspace = true
 
 [dependencies]
+codex-freebsd-sandbox = { workspace = true }
 anyhow = { workspace = true }
 codex-apply-patch = { workspace = true }
 codex-async-utils = { workspace = true }
