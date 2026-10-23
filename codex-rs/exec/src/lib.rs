@@ -1522,6 +1522,28 @@ fn sandbox_mode_from_permission_profile(
         PermissionProfile::External { .. } => None,
         PermissionProfile::Managed { .. } => {
             let file_system_policy = permission_profile.file_system_sandbox_policy();
+            // A legacy mode would reconstruct global root reads on the server.
+            // Omit that override so FreeBSD retains its scoped startup or saved profile.
+            #[cfg(target_os = "freebsd")]
+            {
+                use codex_protocol::permissions::FileSystemPath;
+                use codex_protocol::permissions::FileSystemSpecialPath;
+                let has_root_read = file_system_policy.entries.iter().any(|entry| {
+                    entry.access.can_read()
+                        && match &entry.path {
+                            FileSystemPath::Special { value } => {
+                                matches!(value, FileSystemSpecialPath::Root)
+                            }
+                            FileSystemPath::Path { path } => path
+                                .to_abs_path()
+                                .is_ok_and(|path| path.as_path() == Path::new("/")),
+                            FileSystemPath::GlobPattern { .. } => false,
+                        }
+                });
+                if !has_root_read && !file_system_policy.has_full_disk_write_access() {
+                    return None;
+                }
+            }
             if file_system_policy.has_full_disk_write_access() {
                 permission_profile
                     .network_sandbox_policy()

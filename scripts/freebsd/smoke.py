@@ -128,7 +128,9 @@ def main() -> None:
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        with tempfile.TemporaryDirectory(prefix="codex-native-smoke-") as temp:
+        with tempfile.TemporaryDirectory(
+            prefix="codex-native-smoke-", dir=Path.home()
+        ) as temp:
             root = Path(temp)
             home = root / "home"
             home.mkdir()
@@ -146,7 +148,7 @@ def main() -> None:
                     else ""
                 )
                 + f"""
-model = "gpt-5.4"
+model = "gpt-5.5"
 model_provider = "local_test"
 check_for_update_on_startup = false
 [model_providers.local_test]

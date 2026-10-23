@@ -6,6 +6,9 @@
 mod daybreak_api_key_compat;
 mod events;
 mod external_agent_config;
+#[cfg(all(test, target_os = "freebsd"))]
+#[path = "app_server_session/freebsd_permission_projection_tests.rs"]
+mod freebsd_permission_projection_tests;
 pub(crate) mod fs;
 mod history;
 mod models;
@@ -2074,6 +2077,38 @@ fn service_tier_override_from_config(config: &Config) -> Option<Option<String>> 
     })
 }
 
+fn sandbox_mode_from_config(
+    config: &Config,
+    thread_params_mode: ThreadParamsMode,
+) -> Option<codex_app_server_protocol::SandboxMode> {
+    let profile = config.permissions.effective_permission_profile();
+    #[cfg(target_os = "freebsd")]
+    if thread_params_mode == ThreadParamsMode::Embedded {
+        use codex_protocol::permissions::FileSystemPath;
+        use codex_protocol::permissions::FileSystemSpecialPath;
+        let policy = profile.file_system_sandbox_policy();
+        let has_root_read = policy.entries.iter().any(|entry| {
+            entry.access.can_read()
+                && match &entry.path {
+                    FileSystemPath::Special { value } => {
+                        matches!(value, FileSystemSpecialPath::Root)
+                    }
+                    FileSystemPath::Path { path } => path
+                        .to_abs_path()
+                        .is_ok_and(|path| path.as_path() == std::path::Path::new("/")),
+                    FileSystemPath::GlobPattern { .. } => false,
+                }
+        });
+        if !has_root_read && !policy.has_full_disk_write_access() {
+            // Legacy modes would replace native scoped roots with global root reads.
+            return None;
+        }
+    }
+    #[cfg(not(target_os = "freebsd"))]
+    let _ = thread_params_mode;
+    sandbox_mode_from_permission_profile(&profile, config.cwd.as_path())
+}
+
 fn sandbox_mode_from_permission_profile(
     permission_profile: &PermissionProfile,
     cwd: &std::path::Path,
@@ -2197,12 +2232,7 @@ fn thread_start_params_with_reviewer(
     let permissions = permissions_selection_from_config(config, thread_params_mode);
     let sandbox = permissions
         .is_none()
-        .then(|| {
-            sandbox_mode_from_permission_profile(
-                &config.permissions.effective_permission_profile(),
-                config.cwd.as_path(),
-            )
-        })
+        .then(|| sandbox_mode_from_config(config, thread_params_mode))
         .flatten();
     ThreadStartParams {
         model: config.model.clone(),
@@ -2248,12 +2278,7 @@ fn thread_resume_params_from_config(
     let permissions = permissions_selection_from_config(&config, thread_params_mode);
     let sandbox = permissions
         .is_none()
-        .then(|| {
-            sandbox_mode_from_permission_profile(
-                &config.permissions.effective_permission_profile(),
-                config.cwd.as_path(),
-            )
-        })
+        .then(|| sandbox_mode_from_config(&config, thread_params_mode))
         .flatten();
     let mut config_overrides = config_request_overrides_from_config(&config, thread_params_mode);
     if model_settings == ResumeModelSettings::RestoreFromThread
@@ -2316,12 +2341,7 @@ fn thread_fork_params_from_config(
     let permissions = permissions_selection_from_config(&config, thread_params_mode);
     let sandbox = permissions
         .is_none()
-        .then(|| {
-            sandbox_mode_from_permission_profile(
-                &config.permissions.effective_permission_profile(),
-                config.cwd.as_path(),
-            )
-        })
+        .then(|| sandbox_mode_from_config(&config, thread_params_mode))
         .flatten();
     ThreadForkParams {
         thread_id: thread_id.to_string(),

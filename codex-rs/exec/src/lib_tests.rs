@@ -909,3 +909,131 @@ fn sample_thread_start_response() -> ThreadStartResponse {
         multi_agent_mode: Default::default(),
     }
 }
+
+#[cfg(target_os = "freebsd")]
+#[tokio::test]
+async fn freebsd_lifecycle_scoped_defaults_survive_exec_configuration_round_trip() {
+    for trusted in [false, true] {
+        let home = tempdir().expect("home");
+        let cwd = tempdir().expect("workspace");
+        if trusted {
+            std::fs::write(
+                home.path().join("config.toml"),
+                format!(
+                    "[projects.{}]\ntrust_level = \"trusted\"\n",
+                    serde_json::to_string(&cwd.path().to_string_lossy()).unwrap()
+                ),
+            )
+            .unwrap();
+        }
+        let build = |overrides| {
+            ConfigBuilder::default()
+                .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+                .codex_home(home.path().to_path_buf())
+                .fallback_cwd(Some(cwd.path().to_path_buf()))
+                .harness_overrides(overrides)
+                .build()
+        };
+        let config = build(ConfigOverrides::default())
+            .await
+            .expect("implicit config");
+        let expected = config.permissions.effective_permission_profile();
+        assert!(
+            !expected
+                .file_system_sandbox_policy()
+                .has_full_disk_read_access()
+        );
+        let start = thread_start_params_from_config(&config, &ThreadSource::User);
+        let resume = thread_resume_params_from_config(
+            &config,
+            "saved-thread".into(),
+            /*approvals_reviewer_override*/ None,
+        );
+        assert_eq!((start.sandbox, start.permissions.clone()), (None, None));
+        assert_eq!((resume.sandbox, resume.permissions), (None, None));
+        let restored = build(ConfigOverrides {
+            sandbox_mode: start
+                .sandbox
+                .map(codex_app_server_protocol::SandboxMode::to_core),
+            default_permissions: start.permissions,
+            workspace_roots: start.runtime_workspace_roots,
+            ..Default::default()
+        })
+        .await
+        .expect("app-server config rebuild");
+        assert_eq!(
+            restored.permissions.effective_permission_profile(),
+            expected
+        );
+        for mode in [SandboxMode::ReadOnly, SandboxMode::WorkspaceWrite] {
+            let explicit = build(ConfigOverrides {
+                sandbox_mode: Some(mode),
+                ..Default::default()
+            })
+            .await
+            .expect("explicit legacy selection");
+            let params = thread_start_params_from_config(&explicit, &ThreadSource::User);
+            assert_eq!(
+                params
+                    .sandbox
+                    .map(codex_app_server_protocol::SandboxMode::to_core),
+                Some(mode)
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "freebsd")]
+#[test]
+fn freebsd_lifecycle_root_read_carveouts_keep_legacy_overrides() {
+    use codex_protocol::permissions::{
+        FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, FileSystemSandboxPolicy,
+        FileSystemSpecialPath,
+    };
+    let cwd = Path::new("/project");
+    for root in [
+        FileSystemPath::Special {
+            value: FileSystemSpecialPath::Root,
+        },
+        FileSystemPath::Path {
+            path: codex_utils_path_uri::PathUri::from_host_native_path("/").unwrap(),
+        },
+    ] {
+        for writable in [false, true] {
+            let mut entries = vec![
+                FileSystemSandboxEntry::new(root.clone(), FileSystemAccessMode::Read),
+                FileSystemSandboxEntry::new(
+                    FileSystemPath::Path {
+                        path: codex_utils_path_uri::PathUri::from_host_native_path(
+                            "/project/private",
+                        )
+                        .unwrap(),
+                    },
+                    FileSystemAccessMode::Deny,
+                ),
+            ];
+            if writable {
+                entries.push(FileSystemSandboxEntry::new(
+                    FileSystemPath::Special {
+                        value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+                    },
+                    FileSystemAccessMode::Write,
+                ));
+            }
+            let policy = FileSystemSandboxPolicy::restricted(entries);
+            assert!(!policy.has_full_disk_read_access());
+            let profile = PermissionProfile::from_runtime_permissions(
+                &policy,
+                codex_protocol::permissions::NetworkSandboxPolicy::Restricted,
+            );
+            assert_eq!(
+                sandbox_mode_from_permission_profile(&profile, cwd),
+                Some(if writable {
+                    codex_app_server_protocol::SandboxMode::WorkspaceWrite
+                } else {
+                    codex_app_server_protocol::SandboxMode::ReadOnly
+                })
+            );
+        }
+    }
+}
