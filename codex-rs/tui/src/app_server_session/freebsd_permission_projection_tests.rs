@@ -60,10 +60,12 @@ async fn freebsd_lifecycle_embedded_defaults_do_not_send_legacy_root_overrides()
 #[tokio::test]
 async fn freebsd_lifecycle_root_read_carveouts_keep_explicit_embedded_overrides() {
     use crate::legacy_core::config::ConfigOverrides;
-    use codex_protocol::permissions::{
-        FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, FileSystemSandboxPolicy,
-        FileSystemSpecialPath, NetworkSandboxPolicy,
-    };
+    use codex_protocol::permissions::FileSystemAccessMode;
+    use codex_protocol::permissions::FileSystemPath;
+    use codex_protocol::permissions::FileSystemSandboxEntry;
+    use codex_protocol::permissions::FileSystemSandboxPolicy;
+    use codex_protocol::permissions::FileSystemSpecialPath;
+    use codex_protocol::permissions::NetworkSandboxPolicy;
     let home = tempfile::tempdir().unwrap();
     let cwd = tempfile::tempdir().unwrap();
     for root in [

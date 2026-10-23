@@ -986,10 +986,11 @@ async fn freebsd_lifecycle_scoped_defaults_survive_exec_configuration_round_trip
 #[cfg(target_os = "freebsd")]
 #[test]
 fn freebsd_lifecycle_root_read_carveouts_keep_legacy_overrides() {
-    use codex_protocol::permissions::{
-        FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, FileSystemSandboxPolicy,
-        FileSystemSpecialPath,
-    };
+    use codex_protocol::permissions::FileSystemAccessMode;
+    use codex_protocol::permissions::FileSystemPath;
+    use codex_protocol::permissions::FileSystemSandboxEntry;
+    use codex_protocol::permissions::FileSystemSandboxPolicy;
+    use codex_protocol::permissions::FileSystemSpecialPath;
     let cwd = Path::new("/project");
     for root in [
         FileSystemPath::Special {
