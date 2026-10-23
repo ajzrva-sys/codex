@@ -19,7 +19,22 @@ disabledPluginIds?: Array<string> | null, clientUserMessageId?: string | null, i
  * Optional source classification for the caller that starts this turn.
  * Ignored when this request steers an already-active turn.
  */
-turnTrigger?: string | null, toolOutput?: TurnToolOutput | null, /**
+turnTrigger?: string | null, /**
+ * ID of the turn that caused this new turn to start.
+ *
+ * Set this when starting work on behalf of another turn, such as delegated
+ * work in a different thread. Leave unset for work started directly by the
+ * user. Ignored when this request adds input to an active turn.
+ */
+parentTurnId?: string | null, /**
+ * ID of the first turn in the chain of work that led to this new turn.
+ *
+ * When setting `parentTurnId`, set this to the parent turn's `rootTurnId`
+ * when known. This keeps descendant work attributed to the original turn.
+ * If omitted, the new turn becomes its own root. Ignored when this request
+ * adds input to an active turn.
+ */
+rootTurnId?: string | null, toolOutput?: TurnToolOutput | null, /**
  * Override the working directory for this turn and subsequent turns.
  */
 cwd?: string | null, /**
@@ -50,7 +65,8 @@ effort?: ReasoningEffort | null, /**
  * Override the reasoning summary for this turn and subsequent turns.
  */
 summary?: ReasoningSummary | null, /**
- * Override the personality for this turn and subsequent turns.
+ * @deprecated `friendly` and `pragmatic` no longer select a style.
+ * Changing this does not rewrite the thread's existing instructions.
  */
 personality?: Personality | null, /**
  * Optional JSON Schema used to constrain the final assistant message for

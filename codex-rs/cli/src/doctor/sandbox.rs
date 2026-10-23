@@ -100,11 +100,6 @@ pub(super) fn sandbox_check(config: &Config, arg0_paths: &Arg0DispatchPaths) -> 
         "codex-linux-sandbox helper",
         arg0_paths.codex_linux_sandbox_exe.as_deref(),
     );
-    push_path_detail(
-        &mut details,
-        "execve wrapper helper",
-        arg0_paths.main_execve_wrapper_exe.as_deref(),
-    );
 
     let mut status = CheckStatus::Ok;
     let mut summary = "sandbox configuration is readable".to_string();
@@ -133,13 +128,18 @@ pub(super) fn sandbox_check(config: &Config, arg0_paths: &Arg0DispatchPaths) -> 
 
     #[cfg(target_os = "windows")]
     {
-        let configured_backend = WindowsSandboxLevel::from_config(config);
-        let elevated = configured_backend != WindowsSandboxLevel::Disabled
-            && windows_sandbox_uses_elevated_backend(configured_backend);
-        let backend = if elevated {
-            WindowsSandboxLevel::Elevated
+        let configured_level = WindowsSandboxLevel::from_config(config);
+        let mxc = config.effective_local_windows_sandbox_type()
+            == codex_protocol::sandbox::SandboxType::WindowsMxc;
+        let elevated = !mxc
+            && configured_level != WindowsSandboxLevel::Disabled
+            && windows_sandbox_uses_elevated_backend(configured_level);
+        let backend = if mxc {
+            "mxc".to_string()
+        } else if elevated {
+            WindowsSandboxLevel::Elevated.to_string()
         } else {
-            configured_backend
+            configured_level.to_string()
         };
         let denied = !file_system_sandbox.has_full_disk_read_access();
 
@@ -148,7 +148,7 @@ pub(super) fn sandbox_check(config: &Config, arg0_paths: &Arg0DispatchPaths) -> 
             .details
             .push(format!("denied-read restrictions: {denied}"));
 
-        if denied && !elevated {
+        if denied && !elevated && !mxc {
             check.issues.push(
                 DoctorIssue::new(
                     CheckStatus::Fail,

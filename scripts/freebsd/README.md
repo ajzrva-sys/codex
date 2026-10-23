@@ -2,7 +2,7 @@
 
 This fork builds the Codex CLI natively on FreeBSD and packages it with the
 npm launcher. It does not require Linux compatibility. FreeBSD 15.1 amd64 is
-tested with Rust 1.96.1; arm64 launcher selection has tests but needs native testing.
+tested with Rust 1.99.1; arm64 launcher selection has tests but needs native testing.
 
 ## Build and install
 
@@ -13,9 +13,25 @@ pkg install git rust cmake gmake pkgconf protobuf python3 node24 npm \
   ripgrep bash alsa-lib dbus oniguruma gn ninja llvm21 glib
 ```
 
+V8 152 also needs GN's `generate_modulemap` support. If
+`gn help generate_modulemap` fails (including the FreeBSD GN 2345 package), build
+this pinned GN revision in a private directory and export its path:
+
+```sh
+git clone --depth=1 https://gn.googlesource.com/gn "$HOME/codex-gn"
+git -C "$HOME/codex-gn" fetch --depth=1 origin 3ef636ac7c21b85571c86628507260ec582bef8e
+git -C "$HOME/codex-gn" checkout --detach FETCH_HEAD
+(cd "$HOME/codex-gn" && python3 build/gen.py --no-last-commit-position && ninja -C out -j4 gn)
+export GN="$HOME/codex-gn/out/gn"
+```
+
 Use Rust at least as recent as `codex-rs/rust-toolchain.toml`. The FreeBSD Rust
 package includes Cargo, rustfmt, and Clippy. The build uses the system `protoc`
 on FreeBSD, or the executable specified by `PROTOC`.
+
+For repository formatting checks, install a native Buildifier or set `BUILDIFIER`
+to its absolute path. The bundled DotSlash manifest has no FreeBSD executable.
+`just fmt-check` runs the same format groups and criteria on FreeBSD.
 
 Build as your regular user:
 
@@ -37,8 +53,8 @@ existing native binary, pass `--codex-bin /absolute/path/to/codex`.
 builds also record the Git commit in the executable. Keep the tarball for installation on compatible
 FreeBSD machines with the runtime libraries above.
 
-The tarball includes the native CLI, code-mode helper, sandbox daemon, administrator scripts, ripgrep,
-and the patched npm launcher.
+The tarball includes the native CLI, code-mode helper, sandbox daemon,
+unprivileged relay, administrator scripts, ripgrep, and the patched npm launcher.
 It is self-contained with respect to npm dependencies. The official npm
 registry package does not yet distribute a FreeBSD binary; reinstalling that
 package will not install this fork's build.
@@ -72,7 +88,8 @@ python3 "$(npm root -g)/@openai/codex/freebsd/install_sandbox.py" \
   --daemon "$(npm root -g)/@openai/codex/vendor/x86_64-unknown-freebsd/bin/codex-freebsd-sandboxd"
 ```
 
-The installer copies the daemon to `/usr/local/libexec`, writes a root-owned UID
+The installer copies the daemon and standalone client relay to `/usr/local/libexec`.
+The relay is found beside `--daemon`, or supplied with `--client`. It writes a root-owned UID
 allowlist at `/usr/local/etc/codex-freebsd-sandbox.json`, and enables the
 `codex_freebsd_sandbox` rc service. It loads nullfs, tmpfs, and fdescfs at startup.
 Npm installation itself does not enable privileged services. No SUID executable
@@ -148,7 +165,12 @@ service's job directories while any filesystem remains mounted beneath them.
 The default build includes the V8 code-mode helper required by current models.
 It applies the [FreeBSD ports V8 patches](https://github.com/freebsd/freebsd-ports/tree/34637c4eac759130933a4c101cc25a9a28664bca/misc/codex/files)
 in a separate build directory, preserving Cargo's registry cache and this
-repository's dependency lockfile. The first build compiles V8 from source;
+repository's dependency lockfile. V8 152.2.0 uses the pinned ports patches plus
+local adaptations for upstream compiler, toolchain, and libc++abi changes. The
+LLVM toolchain stays explicit and FreeBSD uses libc++abi's pthread guard rather
+than Linux futexes. Build-cache
+markers include the source version and all patch contents, so changed patches
+cannot reuse a stale patched source tree. The first build compiles V8 from source;
 later builds reuse its archive and generated bindings. Use `--v8-build-dir`
 to choose that directory or `--code-mode-host-bin` to provide a prebuilt helper.
 `--cli-only` omits it and requires a model that supports direct tools; models

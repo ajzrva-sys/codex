@@ -1,0 +1,16 @@
+--- cargo-crates/v8-152.2.0/build/toolchain/gcc_toolchain.gni.orig
++++ cargo-crates/v8-152.2.0/build/toolchain/gcc_toolchain.gni
+@@ -44,6 +44,13 @@
+   assert(
+       target_os == "android" || target_os == "win",
+       "enable_resource_allowlist_generation=true does not work for target_os=$target_os")
++}
++
++declare_args() {
++  extra_cflags = ""
++  extra_cppflags = ""
++  extra_cxxflags = ""
++  extra_ldflags = ""
+ }
+ 
+ # This template defines a toolchain for something that works like gcc

@@ -1,4 +1,5 @@
 use codex_core::TurnInputRequest;
+use core_test_support::test_codex::local_requests;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,7 +45,6 @@ use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_sandbox;
 use core_test_support::skip_if_wine_exec;
 use core_test_support::test_codex::TestCodex;
-use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
@@ -538,7 +538,7 @@ async fn remote_model_override_uses_catalog_model_for_strict_auto_review() -> Re
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(local_selections(cwd_path)),
+                environments: Some(local_requests(cwd_path)),
                 approval_policy: Some(AskForApproval::OnRequest),
                 sandbox_policy: Some(sandbox_policy),
                 permission_profile,
@@ -581,9 +581,7 @@ async fn remote_model_override_uses_catalog_model_for_strict_auto_review() -> Re
         .into_iter()
         .find(|request| {
             request.body_contains_text("auto-review-model-override.txt")
-                && request
-                    .instructions_text()
-                    .starts_with("You are judging one planned coding-agent action.")
+                && request.body_json()["client_metadata"]["x-openai-subagent"] == "guardian"
         })
         .expect("expected Guardian request for apply_patch");
     assert_eq!(
@@ -615,6 +613,7 @@ fn remote_model_with_auto_review_override(slug: &str, review_model: &str) -> Mod
         supports_search_tool: false,
         supports_experimental_context: false,
         use_responses_lite: false,
+        supports_reasoning_effort_updates: false,
         node_repl_auto_review_required: false,
         node_repl_disabled: false,
         auto_review_model_override: Some(review_model.to_string()),

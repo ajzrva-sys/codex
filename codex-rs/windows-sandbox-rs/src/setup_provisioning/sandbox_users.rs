@@ -53,6 +53,10 @@ use crate::write_file_atomically;
 
 use super::SetupMode;
 
+#[cfg(test)]
+#[path = "sandbox_users_tests.rs"]
+mod tests;
+
 const SID_USERS: &str = "S-1-5-32-545";
 
 pub fn resolve_sandbox_users_group_sid() -> Result<Vec<u8>> {
@@ -131,7 +135,8 @@ pub fn ensure_local_user(
             std::ptr::null_mut(),
         );
         if status != NERR_Success {
-            // Try update password via level 1003.
+            // Reset only the password, preserving account flags owned by enterprise policy.
+            // A separate flag update could fail after the reset but before credentials are saved.
             let pw_info = USER_INFO_1003 {
                 usri1003_password: pwd_w.as_ptr() as *mut u16,
             };
@@ -444,7 +449,7 @@ pub(super) fn prepare_setup_marker(
             &security_attributes,
             CREATE_NEW,
             FILE_ATTRIBUTE_NORMAL,
-            /*htemplatefile*/ 0,
+            std::ptr::null_mut(),
         )
     };
     let create_error = unsafe { GetLastError() };
@@ -461,7 +466,7 @@ pub(super) fn prepare_setup_marker(
             ),
         )));
     }
-    let file = unsafe { File::from_raw_handle(marker_handle as *mut c_void) };
+    let file = unsafe { File::from_raw_handle(marker_handle) };
     match mode {
         SetupMode::ProvisionOnly => Ok(PreparedSetupMarker::Retained(file)),
         SetupMode::Full | SetupMode::InteractiveProvision | SetupMode::ReadAclsOnly => {

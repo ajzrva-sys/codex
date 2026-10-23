@@ -26,6 +26,17 @@ direct non-loopback egress and general inbound network access.
 Win32k calls and desktop handles remain available for PowerShell startup;
 clipboard, input-injection, and desktop/system-control restrictions remain.
 
+## Selection and rollout
+
+`windows.sandbox = "mxc"` is strict. The default-off `features.prefer_mxc`
+selects MXC for local execution when available unless local binding is explicitly
+forbidden; otherwise legacy configuration and setup apply. Remote executors keep
+their configured backend. Command failures never trigger backend fallback.
+Desktop can supply `-c features.prefer_mxc=true` from its saved rollout decision
+on the next local Windows launch. Gate changes require a subsequent launch, and
+rollback may require legacy setup. `config/read` retains the configured sandbox;
+`windowsSandbox/readiness` reflects the effective local selection.
+
 ## Launch contract
 
 `create_command_args()` wraps the command like the Seatbelt backend, using the
@@ -33,6 +44,13 @@ executor's Codex executable as the native SDK helper. It carries one typed
 request: the canonical `PermissionProfile`, policy cwd, proxy context, and exact
 argv. The helper inherits command cwd, environment, and stdio from the shared
 process path; policy cwd can differ from command cwd.
+
+Windows MXC reserves `SystemDrive` and `LOCALAPPDATA` for the host's validated,
+nonempty values in both wrapper and explicit child environments. Caller
+overrides are replaced case-insensitively; unavailable host values fail before
+launch with a diagnostic naming the variable.
+Windows may virtualize the child's `LOCALAPPDATA` into a sandbox directory
+beneath the host profile.
 
 The request uses launcher-only environment chunks to leave Windows' command-line
 budget to the workload. Payloads are limited to 1,000,000 UTF-8 bytes and chunks
@@ -46,17 +64,23 @@ to 4096 bytes; the helper removes them before native process creation. Use
   semantics and scan limits as the existing Windows sandbox.
 - Native deny paths depend on the host's capability probe. An installed Windows
   update alone is not treated as evidence that every policy feature is enabled.
-- This adapter rejects managed networking with `allow_local_binding=false`:
-  its host-loopback permission is bidirectional. MXC's proxy-peer identity mode
-  is not integrated here. With local binding enabled, direct DNS remains denied,
-  matching the existing Windows sandbox.
+- When MXC is the executor's selected backend, managed networking defaults
+  `allow_local_binding` to `true`. An effective `false` after applying managed
+  requirements is a configuration error: native host-loopback access
+  is bidirectional, and MXC's proxy-peer identity mode is not integrated here.
+  `true` permits local servers and direct host-loopback connections and removes
+  the proxy's additional private-network destination checks. Proxy domain rules
+  still apply to proxied traffic; direct DNS remains denied. This default also
+  applies to remote Windows executors and does not enable disabled networking.
 - Windows volume-root grants do not recurse. The adapter grants the root and
   its immediate children; directories added or newly mounted during a running
   command are not implicitly granted.
 - The native API represents paths and environment values as Unicode strings.
   Non-Unicode values fail instead of undergoing lossy conversion.
-- An explicitly empty child environment is rejected: the SDK replaces an empty
-  environment list with profile defaults and has no explicit-empty option.
+- An empty child environment still uses the Windows user-profile defaults.
+  Supplying only two keys would turn it into an incomplete explicit environment,
+  so the wrapper's bootstrap values are removed before the SDK selects defaults.
+  Nonempty environments remain explicit except for these two host-owned values.
 - The upstream runner terminates remaining descendants when the foreground
   process exits, as well as on cancellation. Both existing Windows backends
   preserve descendants after normal exit, so detached servers currently lose

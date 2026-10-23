@@ -7,6 +7,7 @@ use codex_extension_api::ResponseItem;
 use codex_protocol::protocol::TruncationPolicy;
 
 use super::config::GuardianV2Config;
+use super::config::MAX_MODEL_CONTEXT_ITEM_TOKENS;
 use super::sampler::LunaSampler;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -29,23 +30,25 @@ pub(super) fn select_parent_compaction(
     sampler: &LunaSampler,
     legacy_model_hash: Option<&str>,
 ) -> Result<ParentCompaction, ParentCompactionError> {
+    let checkpoint = history.latest_compaction();
     let model_hash = match mode {
+        GuardianContextMode::Independent => {
+            return Ok(ParentCompaction {
+                item: None,
+                model_hash: None,
+            });
+        }
         GuardianContextMode::Legacy => legacy_model_hash,
-        GuardianContextMode::ThreadOwned => history.latest_compaction_model_hash(),
+        GuardianContextMode::ThreadOwned => checkpoint.and_then(|checkpoint| checkpoint.model_hash),
     };
     if mode == GuardianContextMode::ThreadOwned
-        && history.items().any(|item| {
-            matches!(
-                item,
-                ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. }
-            )
-        })
+        && checkpoint.is_some()
         && (!config.reuse_parent_compaction || !sampler.supports_parent_compaction(model_hash))
     {
         return Err(ParentCompactionError::RequiresSync);
     }
     let item = if config.reuse_parent_compaction {
-        match encrypted_parent_compaction(history.items(), config.max_parent_compaction_tokens) {
+        match encrypted_parent_compaction(checkpoint, config.max_parent_compaction_tokens) {
             Ok(item) => item,
             Err(ParentCompactionError::Unusable) if mode == GuardianContextMode::Legacy => None,
             Err(error) => return Err(error),
@@ -66,41 +69,26 @@ pub(super) fn select_parent_compaction(
 
 // An unusable latest compaction must never fall back to an older one. Missing
 // encrypted content is rejected here; only legacy callers may omit that checkpoint.
-fn encrypted_parent_compaction<'a>(
-    items: impl Iterator<Item = &'a ResponseItem>,
+fn encrypted_parent_compaction(
+    checkpoint: Option<codex_history::CompactionCheckpoint<'_>>,
     max_parent_compaction_tokens: usize,
 ) -> Result<Option<ResponseItem>, ParentCompactionError> {
-    let max_compaction_bytes = TruncationPolicy::Tokens(max_parent_compaction_tokens).byte_budget();
-    let Some(item) = items
-        .filter(|item| {
-            matches!(
-                item,
-                ResponseItem::Compaction { .. } | ResponseItem::ContextCompaction { .. }
-            )
-        })
-        .last()
-    else {
+    // Keep the previous maximum configured wire allowance as a separate hard
+    // bound; the configured token budget measures model cost, not ciphertext.
+    let max_compaction_bytes =
+        TruncationPolicy::Tokens(MAX_MODEL_CONTEXT_ITEM_TOKENS).byte_budget();
+    let Some(checkpoint) = checkpoint else {
         return Ok(None);
     };
-
-    let encrypted_content = match item {
-        ResponseItem::Compaction {
-            id: Some(_),
-            encrypted_content,
-            ..
-        }
-        | ResponseItem::ContextCompaction {
-            id: Some(_),
-            encrypted_content: Some(encrypted_content),
-            ..
-        } => encrypted_content,
-        _ => return Err(ParentCompactionError::Unusable),
-    };
-    if encrypted_content.is_empty() {
+    if !checkpoint.is_usable() {
         return Err(ParentCompactionError::Unusable);
     }
+    let item = checkpoint.item;
     let serialized = serde_json::to_vec(item).map_err(|_| ParentCompactionError::Serialization)?;
-    if serialized.len() > max_compaction_bytes {
+    if serialized.len() > max_compaction_bytes
+        || codex_guardian_context::estimate_input_tokens_from_serialized_len(item, serialized.len())
+            > max_parent_compaction_tokens
+    {
         return Err(ParentCompactionError::Oversized);
     }
 

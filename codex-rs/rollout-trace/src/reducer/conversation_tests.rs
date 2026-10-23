@@ -68,7 +68,7 @@ fn request_snapshots_reuse_history_without_deduping_new_identical_items() -> any
 }
 
 #[test]
-fn response_outputs_enter_thread_conversation_on_completion() -> anyhow::Result<()> {
+fn response_outputs_require_harness_acceptance() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let writer = create_started_writer(&temp)?;
     start_turn(&writer, "turn-1")?;
@@ -88,7 +88,16 @@ fn response_outputs_enter_thread_conversation_on_completion() -> anyhow::Result<
             "output_items": [
                 {
                     "type": "message",
+                    "id": "msg-observed",
                     "role": "assistant",
+                    "phase": "partial_answer",
+                    "content": [{"type": "output_text", "text": "first tests passed"}]
+                },
+                {
+                    "type": "message",
+                    "id": "msg-accepted",
+                    "role": "assistant",
+                    "phase": "final_answer",
                     "content": [{"type": "output_text", "text": "tests passed"}]
                 }
             ]
@@ -96,12 +105,47 @@ fn response_outputs_enter_thread_conversation_on_completion() -> anyhow::Result<
     )?;
     append_inference_completion(&writer, "inference-1", "resp-1", response)?;
 
+    let observed = replay_bundle(temp.path())?;
+    assert_eq!(
+        observed.threads["thread-root"].conversation_item_ids,
+        observed.inference_calls["inference-1"].request_item_ids,
+    );
+    writer.append_with_context(
+        trace_context("turn-1"),
+        RawTraceEventPayload::HistoryItemAccepted {
+            item_id: "msg-accepted".into(),
+        },
+    )?;
+
     let rollout = replay_bundle(temp.path())?;
     let inference = &rollout.inference_calls["inference-1"];
     let mut expected_thread_items = inference.request_item_ids.clone();
-    expected_thread_items.extend(inference.response_item_ids.clone());
+    expected_thread_items.push(inference.response_item_ids[1].clone());
 
-    assert_eq!(inference.response_item_ids.len(), 1);
+    assert_eq!(
+        inference
+            .response_item_ids
+            .iter()
+            .map(|id| {
+                let item = &rollout.conversation_items[id];
+                (item.channel.clone(), item.body.parts.clone())
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                Some(ConversationChannel::Final),
+                vec![ConversationPart::Text {
+                    text: "first tests passed".into(),
+                }]
+            ),
+            (
+                Some(ConversationChannel::Final),
+                vec![ConversationPart::Text {
+                    text: "tests passed".into(),
+                }]
+            ),
+        ],
+    );
     assert_eq!(
         rollout.threads["thread-root"].conversation_item_ids,
         expected_thread_items,

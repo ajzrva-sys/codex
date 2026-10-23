@@ -7,17 +7,20 @@ mod coverage;
 mod decision;
 mod feedback;
 mod input_budget;
+mod permissions;
 mod prompt;
 pub(crate) use input_budget::PendingReviewContext;
 pub(crate) use input_budget::check_pending as check_pending_guardian_input;
 pub(crate) use input_budget::finalize as finalize_guardian_input;
+pub(crate) use input_budget::should_compact as should_compact_guardian_input;
+pub(crate) use permissions::for_tool as tool_permission_context;
 mod request_budget;
 pub(crate) use request_budget::ExhaustedReviewBudget;
-pub(crate) use request_budget::check_prompt as check_guardian_prompt_budget;
-pub(crate) use request_budget::observe as observe_guardian_request;
+pub(crate) use request_budget::prepare_prompt as prepare_guardian_prompt;
 mod review;
 mod review_session;
 mod reviewer_config;
+pub(crate) use reviewer_config::resolve_review_model;
 mod runtime;
 #[cfg(test)]
 pub(crate) mod test_host;
@@ -33,6 +36,7 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::GuardianAssessmentOutcome;
 
+use crate::agents_md::LoadedAgentsMd;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::session::step_context::StepContext;
 use crate::session::step_settings::ResolvedStepSettings;
@@ -44,11 +48,8 @@ pub(crate) use approval_request::GuardianMcpAnnotations;
 pub(crate) use approval_request::GuardianNetworkAccessTrigger;
 #[cfg(test)]
 pub(crate) use approval_request::guardian_approval_request_to_json;
-pub(crate) use codex_guardian_reviewer::guardian_timeout_message;
 pub(crate) use decision::decide_approval;
 pub(crate) use decision::spawn_approval_decision;
-pub(crate) use prompt::BUNDLED_GUARDIAN_POLICY;
-pub(crate) use prompt::BUNDLED_GUARDIAN_POLICY_TEMPLATE;
 pub(crate) use prompt::guardian_truncate_text;
 pub(crate) use review::GuardianReviewOptions;
 pub(crate) use review::is_basic_session_source;
@@ -78,13 +79,14 @@ pub(crate) const GUARDIAN_MAX_NODE_REPL_TOOL_RESULT_TOKENS: usize = 6_000;
 /// Background network approvals and Unix interception use the active task's resolved settings.
 /// Startup reviewer prewarming intentionally uses turn-only inputs because it has no issuing step.
 ///
-/// MCP elicitation reviews continue to use turn-only inputs.
+/// MCP elicitations use their live invocation's issuing step when available, otherwise turn inputs.
 #[derive(Clone)]
 pub(crate) struct GuardianReviewContext {
     /// The latest response ID received in this turn when review was requested.
     pub(crate) parent_response_id: Option<String>,
     turn: Arc<TurnContext>,
     environments: TurnEnvironmentSnapshot,
+    project_instructions: Option<Arc<LoadedAgentsMd>>,
     // Model and reasoning inputs are carried for the follow-up Guardian and V2 migrations.
     pub(crate) model_info: Arc<ModelInfo>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
@@ -95,6 +97,17 @@ pub(crate) struct GuardianReviewContext {
 }
 
 impl GuardianReviewContext {
+    /// Keep the issuing instructions across retries even if a later turn selects other environments.
+    async fn capture_project_instructions(&mut self, session: &crate::session::session::Session) {
+        if self.project_instructions.is_none() {
+            self.project_instructions = session
+                .services
+                .agents_md_manager
+                .project_snapshot(&self.turn.config, &self.environments)
+                .await;
+        }
+    }
+
     pub(crate) fn model_context(&self) -> ModelInvocationContext {
         ModelInvocationContext {
             model_slug: self.model_info.slug.clone(),
@@ -117,6 +130,7 @@ impl GuardianReviewContext {
                 .get::<codex_api::ResponseId>()
                 .map(|id| id.0.clone()),
             environments: environments.clone(),
+            project_instructions: None,
             model_info: Arc::clone(&settings.model_info),
             reasoning_effort: settings.reasoning_effort().cloned(),
             reasoning_summary: settings.reasoning_summary,
@@ -146,6 +160,7 @@ impl From<&Arc<StepContext>> for GuardianReviewContext {
                 .map(|id| id.0.clone()),
             turn: Arc::clone(&step.turn),
             environments: step.environments.clone(),
+            project_instructions: Some(step.loaded_agents_md.clone().unwrap_or_default()),
             model_info: Arc::clone(&step.settings.model_info),
             reasoning_effort: step.settings.reasoning_effort().cloned(),
             reasoning_summary: step.settings.reasoning_summary,
@@ -163,7 +178,8 @@ impl From<Arc<TurnContext>> for GuardianReviewContext {
                 .extension_data
                 .get::<codex_api::ResponseId>()
                 .map(|id| id.0.clone()),
-            environments: turn.environments.clone(),
+            environments: turn.initial_environments.clone(),
+            project_instructions: None,
             model_info: Arc::clone(turn.model_info()),
             reasoning_effort: turn.reasoning_effort().cloned(),
             reasoning_summary: turn.reasoning_summary(),

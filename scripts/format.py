@@ -69,10 +69,17 @@ def buildifier_formatter_group(*, check: bool) -> FormatterGroup:
             buildifier_files.append(path.as_posix())
     buildifier_files.sort()
 
-    # Invoke DotSlash explicitly because Windows does not honor shebangs.
+    buildifier = os.environ.get("BUILDIFIER")
+    if buildifier:
+        launcher = [buildifier]
+    elif sys.platform.startswith("freebsd"):
+        # The pinned DotSlash manifest has no FreeBSD executable.
+        launcher = ["buildifier"]
+    else:
+        # Invoke DotSlash explicitly because Windows does not honor shebangs.
+        launcher = ["dotslash", str(REPO_ROOT / "tools" / "buildifier")]
     buildifier_args = [
-        "dotslash",
-        str(REPO_ROOT / "tools" / "buildifier"),
+        *launcher,
         "-mode=check" if check else "-mode=fix",
         "-lint=off",
         *buildifier_files,

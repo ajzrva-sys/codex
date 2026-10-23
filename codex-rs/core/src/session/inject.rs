@@ -1,6 +1,7 @@
 use super::TurnInput as PendingTurnInput;
 use super::session::Session;
 use super::turn_context::TurnContext;
+use codex_analytics::ImagePreparationMetadata;
 use codex_features::Feature;
 use codex_history::CodexHarnessMetadata;
 use codex_history::ResponseItemEnvelope;
@@ -18,7 +19,7 @@ impl Session {
         input: Vec<T>,
     ) -> Result<(), Vec<T>> {
         let mut active = self.active_turn.lock().await;
-        match active.as_mut() {
+        match active.as_mut().filter(|turn| turn.finishing.is_none()) {
             Some(active_turn) => {
                 self.input_queue
                     .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
@@ -80,7 +81,7 @@ impl Session {
             .map(|item| self.annotate_client_response_item(item))
             .collect::<Vec<_>>();
         let mut active = self.active_turn.lock().await;
-        if let Some(active_turn) = active.as_mut() {
+        if let Some(active_turn) = active.as_mut().filter(|turn| turn.finishing.is_none()) {
             self.input_queue
                 .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
                     active_turn.turn_state.as_ref(),
@@ -92,7 +93,11 @@ impl Session {
                 .await;
             return;
         }
+        let finishing = active.as_ref().and_then(|turn| turn.finishing.clone());
         drop(active);
+        if let Some(finishing) = finishing {
+            finishing.cancelled().await;
+        }
         self.record_annotated_conversation_items(turn_context, turn_context.model_info(), items)
             .await;
     }
@@ -124,14 +129,34 @@ impl Session {
             return;
         }
 
+        let (annotated_items, image_preparations) = self
+            .prepare_annotated_conversation_items_for_history(turn_context, model_info, items)
+            .await;
+        self.record_prepared_conversation_items(
+            turn_context,
+            model_info,
+            annotated_items,
+            image_preparations,
+        )
+        .await;
+    }
+
+    pub(crate) async fn prepare_annotated_conversation_items_for_history(
+        &self,
+        turn_context: &TurnContext,
+        model_info: &ModelInfo,
+        items: Vec<ResponseItemEnvelope>,
+    ) -> (Vec<ResponseItemEnvelope>, Vec<ImagePreparationMetadata>) {
         let mut annotated_items = Vec::with_capacity(items.len());
         let mut image_preparations = Vec::new();
         for envelope in items {
-            let (prepared_items, prepared_images) = self.prepare_conversation_items_for_history(
-                turn_context,
-                model_info,
-                std::slice::from_ref(&envelope.item),
-            );
+            let (prepared_items, prepared_images) = self
+                .prepare_conversation_items_for_history(
+                    turn_context,
+                    model_info,
+                    std::slice::from_ref(&envelope.item),
+                )
+                .await;
             image_preparations.extend(prepared_images);
 
             let mut metadata = envelope.metadata;
@@ -142,13 +167,7 @@ impl Session {
                 }
             }));
         }
-        self.record_prepared_conversation_items(
-            turn_context,
-            model_info,
-            annotated_items,
-            image_preparations,
-        )
-        .await;
+        (annotated_items, image_preparations)
     }
 
     /// Injects items into active work, or records them without starting a turn.
@@ -160,6 +179,15 @@ impl Session {
         let Err(items) = self.inject_if_running(items).await else {
             return;
         };
+        let finishing = self
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|turn| turn.finishing.clone());
+        if let Some(finishing) = finishing {
+            finishing.cancelled().await;
+        }
         let default_turn_context;
         let turn_context = match current_turn_context {
             Some(turn_context) => turn_context,

@@ -1,6 +1,7 @@
-//! Model catalog cache identity follows provider routing and effective auth.
+//! Model catalog cache identity follows provider routing, effective auth, and gateway OAuth config.
 //! Only a digest is persisted; access tokens for ChatGPT are excluded so token
 //! rotation does not discard a catalog for the same account, user, and plan.
+//! Header auth with an account ID uses that identity instead of opaque auth headers.
 
 use codex_login::CodexAuth;
 use codex_model_provider_info::ModelProviderInfo;
@@ -9,14 +10,12 @@ use sha2::Digest;
 use sha2::Sha256;
 
 use crate::auth::resolve_provider_auth;
-use crate::provider::enforce_managed_residency;
 
 pub(crate) fn identity(
     provider_info: &ModelProviderInfo,
     auth: Option<&CodexAuth>,
 ) -> CoreResult<String> {
-    let mut provider = provider_info.to_api_provider(auth.map(CodexAuth::auth_mode))?;
-    enforce_managed_residency(&mut provider);
+    let mut api_provider = provider_info.to_api_provider(auth.map(CodexAuth::auth_mode))?;
     let mut digest = Sha256::new();
     // Length-prefix every field to avoid ambiguity between adjacent values.
     let mut field = |value: &[u8]| {
@@ -24,9 +23,15 @@ pub(crate) fn identity(
         digest.update(value);
     };
     field(b"models-cache-v1");
-    field(provider.name.as_bytes());
-    field(provider.base_url.as_bytes());
-    let mut query: Vec<_> = provider.query_params.iter().flatten().collect();
+    field(api_provider.name.as_bytes());
+    field(api_provider.base_url.as_bytes());
+    // Preserve existing cache identities when no explicit catalog is configured.
+    // The API provider resolves base_url defaults; model_catalog_url stays on ModelProviderInfo.
+    if let Some(catalog_url) = &provider_info.model_catalog_url {
+        field(b"model_catalog_url");
+        field(catalog_url.as_bytes());
+    }
+    let mut query: Vec<_> = api_provider.query_params.iter().flatten().collect();
     query.sort();
     field(&(query.len() as u64).to_le_bytes());
     for (name, value) in query {
@@ -53,21 +58,30 @@ pub(crate) fn identity(
         field(&[u8::from(auth.is_fedramp_account())]);
     }
     let has_stable_account = auth.is_some_and(|auth| {
-        matches!(
-            auth,
-            CodexAuth::Chatgpt(_) | CodexAuth::ChatgptAuthTokens(_) | CodexAuth::AgentIdentity(_)
-        ) && auth.get_account_id().is_some()
-            && (auth.get_chatgpt_user_id().is_some() || auth.get_account_email().is_some())
+        auth.get_account_id().is_some()
+            && if matches!(auth, CodexAuth::Headers(_)) {
+                !provider_info.has_command_auth()
+            } else {
+                matches!(
+                    auth,
+                    CodexAuth::Chatgpt(_)
+                        | CodexAuth::ChatgptAuthTokens(_)
+                        | CodexAuth::AgentIdentity(_)
+                ) && (auth.get_chatgpt_user_id().is_some() || auth.get_account_email().is_some())
+            }
     });
     let explicit_bearer =
         provider_info.api_key()?.is_some() || provider_info.experimental_bearer_token.is_some();
     // Command auth also returns opaque API keys. A changed key may belong to a
-    // different account, so only credentials with stable owner metadata can be reused.
+    // different account, so reuse requires stable owner metadata. Explicit provider
+    // keys take precedence over the header auth's account identity.
     if !has_stable_account || explicit_bearer {
-        let headers = resolve_provider_auth(auth, provider_info)?.to_auth_headers();
-        provider.headers.extend(headers);
+        let headers = resolve_provider_auth(auth, provider_info)?
+            .to_auth_headers()
+            .map_err(|error| codex_api::map_api_error(error.into()))?;
+        api_provider.headers.extend(headers);
     }
-    let mut headers: Vec<_> = provider.headers.iter().collect();
+    let mut headers: Vec<_> = api_provider.headers.iter().collect();
     headers.sort_by(|(a, av), (b, bv)| {
         a.as_str()
             .cmp(b.as_str())
@@ -77,6 +91,10 @@ pub(crate) fn identity(
     for (name, value) in headers {
         field(name.as_str().as_bytes());
         field(value.as_bytes());
+    }
+    // Preserve existing identities for providers without gateway OAuth.
+    if let Some(gateway_oauth) = &provider_info.gateway_oauth {
+        field(&serde_json::to_vec(gateway_oauth)?);
     }
     Ok(format!("{:x}", digest.finalize()))
 }

@@ -2,6 +2,10 @@
 //! Worktrees start at the repository default branch and bind only the new session.
 
 use super::*;
+use crate::app_server_session::is_server_shutting_down_error;
+use crate::startup_draft::StartupDraftInitialScreen;
+use crate::startup_draft::StartupDraftPump;
+use crate::startup_draft::StartupDraftSessionAction;
 
 /// Owns a freshly created checkout until the UI accepts its completion event.
 /// Dropping a cancelled worker or undelivered event removes only a clean checkout.
@@ -28,9 +32,10 @@ impl App {
     fn agents_overview_retained_worktree_error(
         &mut self,
         checkout: &codex_worktree::ManagedWorktree,
+        title: Option<&'static str>,
         reason: impl std::fmt::Display,
     ) {
-        self.add_agents_overview_error(format!("{reason} A checkout was retained at {}; remove it with `git worktree remove <checkout-path>` from the source repository if it is no longer needed.", checkout.root.display()));
+        self.show_agents_overview_error(title, format!("{reason} A checkout was retained at {}; remove it with `git worktree remove <checkout-path>` from the source repository if it is no longer needed.", checkout.root.display()));
     }
 
     pub(in crate::app) async fn new_agents_overview_session(
@@ -39,13 +44,53 @@ impl App {
         app_server: &mut AppServerSession,
         cwd: Option<AbsolutePathBuf>,
     ) -> Result<AppRunControl> {
+        if self.reconnect.offline || self.windows_sandbox_blocks_thread_switch() {
+            return Ok(AppRunControl::Continue);
+        }
+        let previous_thread = self.current_displayed_thread_id();
+        let mut draft = self
+            .agents_overview
+            .new_session_draft
+            .take()
+            .unwrap_or_else(|| {
+                Box::new(StartupDraftPump::new(
+                    tui,
+                    StartupDraftInitialScreen::Composer,
+                    StartupDraftSessionAction::NewFromCommandCenter,
+                ))
+            });
+        let mut display_config = self.chat_widget.config_ref().clone();
+        if let Some(cwd) = cwd.as_ref() {
+            display_config.cwd = cwd.clone();
+        }
+        draft.apply_settings(
+            &crate::local_settings::LocalSettings::from(&display_config),
+            display_config.cwd.as_path(),
+        );
+        draft.show(tui)?;
         // Keep the large session-start future off the TUI's stack in dev builds.
-        Box::pin(
-            self.start_agents_overview_session(
-                tui, app_server, cwd, /*managed_worktree*/ None,
-            ),
-        )
-        .await
+        let result = Box::pin(self.start_agents_overview_session(
+            tui,
+            app_server,
+            cwd,
+            /*managed_worktree*/ None,
+            Some(&mut draft),
+        ))
+        .await;
+        if self.current_displayed_thread_id() != previous_thread {
+            draft.flush_pending_paste_newline(tui).await?;
+            self.chat_widget
+                .empty_state_animation
+                .borrow_mut()
+                .continue_from(&mut draft.blossom.borrow_mut());
+            self.chat_widget.restore_startup_draft(draft.take_draft());
+        } else {
+            // Retain edits if setup fails so retrying `n` does not lose the draft.
+            draft.flush_pending_events(tui).await?;
+            self.agents_overview.new_session_draft = Some(draft);
+        }
+        tui.frame_requester().schedule_frame();
+        result
     }
 
     pub(in crate::app) async fn start_agents_overview_session(
@@ -57,29 +102,39 @@ impl App {
             codex_worktree::WorktreeManager,
             codex_worktree::ManagedWorktree,
         )>,
+        mut startup_draft: Option<&mut StartupDraftPump>,
     ) -> Result<AppRunControl> {
         if self.reconnect.offline || self.windows_sandbox_blocks_thread_switch() {
             if let Some((_, checkout)) = &managed_worktree {
                 self.agents_overview_retained_worktree_error(
                     checkout,
+                    /*title*/ None,
                     "Could not start the session.",
                 );
             }
             return Ok(AppRunControl::Continue);
         }
         let Some((config, remote_cwd)) = self
-            .agents_overview_session_config(tui, app_server, cwd)
+            .agents_overview_session_config(tui, app_server, cwd, startup_draft.as_deref_mut())
             .await
         else {
             if let Some((_, checkout)) = &managed_worktree {
                 self.agents_overview_retained_worktree_error(
                     checkout,
+                    /*title*/ None,
                     "Could not load the new session settings.",
                 );
             }
             return Ok(AppRunControl::Continue);
         };
         let selected_profile = self.chat_widget.thread_id().and_then(|thread_id| {
+            if let Some(selection) = self
+                .agents_overview
+                .requested_permission_profiles
+                .get(&thread_id)
+            {
+                return Some(selection.clone());
+            }
             let source = self.chat_widget.config_ref();
             let active = source.permissions.active_permission_profile()?;
             (self
@@ -94,25 +149,46 @@ impl App {
                 display_label: active.id,
             })
         });
-        let result = app_server
-            .start_thread_with_session_start_source(
-                &crate::local_settings::LocalSettings::from(&config),
+        let local_settings = self.local_settings.reloaded(&config);
+        if let Some(draft) = startup_draft.as_deref_mut() {
+            draft.apply_settings(&local_settings, config.cwd.as_path());
+        }
+        let result = StartupDraftPump::run_with_optional_draft(
+            startup_draft.as_deref_mut(),
+            tui,
+            Box::pin(app_server.start_thread_with_session_start_source(
+                &local_settings,
                 &config,
                 /*session_start_source*/ None,
                 remote_cwd.as_deref(),
                 selected_profile.as_ref(),
-            )
-            .await;
+            )),
+        )
+        .await;
         let started = match result {
             Ok(started) => started,
             Err(error) => {
-                if let Some((_, checkout)) = &managed_worktree {
-                    self.agents_overview_retained_worktree_error(
-                        checkout,
-                        format!("Failed to start session: {error}"),
+                let (title, message) = if matches!(
+                    error.downcast_ref::<TypedRequestError>(),
+                    Some(TypedRequestError::Server { source, .. })
+                        if is_server_shutting_down_error(source)
+                ) {
+                    let mut message = String::from(
+                        "New sessions are paused while active turns finish or are canceled. The default shutdown wait is up to one minute.",
                     );
+                    if !matches!(self.app_server_target, AppServerTarget::Embedded) {
+                        message.push_str(
+                            " If the server restarts, Codex will reconnect automatically.",
+                        );
+                    }
+                    (Some("Codex's background server is shutting down"), message)
                 } else {
-                    self.add_agents_overview_error(format!("Failed to start session: {error}"));
+                    (None, format!("Failed to start session: {error}"))
+                };
+                if let Some((_, checkout)) = &managed_worktree {
+                    self.agents_overview_retained_worktree_error(checkout, title, message);
+                } else {
+                    self.show_agents_overview_error(title, message);
                 }
                 return Ok(AppRunControl::Continue);
             }
@@ -135,7 +211,7 @@ impl App {
                 };
             if let Err(error) = result {
                 let _ = app_server.thread_unsubscribe(thread_id).await;
-                self.agents_overview_retained_worktree_error(checkout, error);
+                self.agents_overview_retained_worktree_error(checkout, /*title*/ None, error);
                 return Ok(AppRunControl::Continue);
             }
         }
@@ -144,15 +220,21 @@ impl App {
             .insert(thread_id, started.clone());
         // Use the dashboard's existing attachment path, which preserves running agents
         // and unsent input in the previous session. Do not send an initial turn.
-        let control = self
-            .attach_agents_overview_thread(tui, app_server, thread_id, Some((config, started)))
-            .await?;
+        let control = Box::pin(self.attach_agents_overview_thread(
+            tui,
+            app_server,
+            thread_id,
+            Some((config, started)),
+            startup_draft,
+        ))
+        .await?;
         if self.current_displayed_thread_id() != Some(thread_id) {
             self.agents_overview.blank_sessions.remove(&thread_id);
             let _ = app_server.thread_unsubscribe(thread_id).await;
             if let Some((_, checkout)) = &managed_worktree {
                 self.agents_overview_retained_worktree_error(
                     checkout,
+                    /*title*/ None,
                     "Could not open the new session.",
                 );
             }
@@ -172,19 +254,17 @@ impl App {
         {
             return;
         }
-        if !self.config.features.enabled(Feature::Worktrees)
-            || crate::uses_remote_workspace_or_environment(
-                &self.app_server_target,
-                self.environment_manager.as_ref(),
-            )
-        {
+        if crate::uses_remote_workspace_or_environment(
+            &self.app_server_target,
+            self.environment_manager.as_ref(),
+        ) {
             self.add_agents_overview_error(
                 "Managed worktrees require local worktree support.".to_string(),
             );
             return;
         }
         let Some((config, _)) = self
-            .agents_overview_session_config(tui, app_server, cwd)
+            .agents_overview_session_config(tui, app_server, cwd, /*startup_draft*/ None)
             .await
         else {
             return;

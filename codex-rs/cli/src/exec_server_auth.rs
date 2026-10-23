@@ -19,6 +19,7 @@ use http::HeaderMap;
 /// Creates a SigV4 provider, preferring an explicit profile over the default credential chain.
 pub(super) async fn aws_sigv4_auth_provider(
     mut config: AwsAuthConfig,
+    http_client_factory: codex_http_client::HttpClientFactory,
 ) -> Result<SharedAuthProvider, AwsAuthError> {
     config.profile = config
         .profile
@@ -29,9 +30,9 @@ pub(super) async fn aws_sigv4_auth_provider(
         .map(|region| region.trim().to_string())
         .filter(|region| !region.is_empty());
     let context = if config.profile.is_some() {
-        AwsAuthContext::load_profile(config).await
+        AwsAuthContext::load_profile(config, http_client_factory).await
     } else {
-        AwsAuthContext::load(config).await
+        AwsAuthContext::load(config, http_client_factory).await
     }?;
     Ok(Arc::new(AwsSigV4AuthProvider { context }))
 }
@@ -42,7 +43,9 @@ struct AwsSigV4AuthProvider {
 }
 
 impl AuthProvider for AwsSigV4AuthProvider {
-    fn add_auth_headers(&self, _headers: &mut HeaderMap) {}
+    fn add_auth_headers(&self, _headers: &mut HeaderMap) -> Result<(), AuthError> {
+        Ok(())
+    }
 
     fn apply_auth(&self, mut request: Request) -> codex_api::AuthProviderFuture<'_> {
         Box::pin(async move {

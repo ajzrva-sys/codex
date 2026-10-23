@@ -10,6 +10,7 @@ async fn replay_preserves_typed_updates_before_voice_steers_the_turn() {
     chat.replay_thread_turns(
         vec![Turn {
             id: "typed-then-voice".into(),
+            root_turn_id: None,
             items: vec![
                 user_item("Typed question"),
                 agent_item(
@@ -79,6 +80,7 @@ async fn in_progress_voice_replay_restores_the_late_reasoning_guard() {
     chat.replay_thread_turns(
         vec![Turn {
             id: "saved-voice-turn".into(),
+            root_turn_id: None,
             items: vec![voice_request.clone()],
             items_view: TurnItemsView::Full,
             status: TurnStatus::InProgress,
@@ -340,19 +342,7 @@ async fn restored_partial_caption_accepts_late_completion_without_duplicate_hist
             before_turn_id: None,
         },
     ]));
-    let live = chat
-        .realtime_conversation
-        .live_transcript_cell
-        .as_ref()
-        .unwrap();
-    insta::assert_snapshot!(
-        "restored_voice_partial_live",
-        live.display_lines(/*width*/ 80)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
+    assert!(chat.realtime_conversation.live_transcript_cell.is_none());
     chat.on_realtime_transcript_delta("user".into(), "words".into());
     let retained = chat.take_realtime_transcript_cells_for_replay();
     assert_eq!(retained.len(), 1);

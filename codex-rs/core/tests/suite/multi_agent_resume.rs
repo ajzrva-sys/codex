@@ -1,13 +1,16 @@
 use anyhow::Result;
+use codex_analytics::AnalyticsEventsClient;
 use codex_core::TurnInputRequest;
 use codex_core::config::AgentRoleConfig;
 use codex_features::Feature;
+use codex_login::CodexAuth;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
+use codex_thread_store::ReadThreadParams;
 use core_test_support::responses::assert_parent_turn;
 use core_test_support::responses::assert_root_turn;
 use core_test_support::responses::ev_assistant_message;
@@ -17,6 +20,7 @@ use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::mount_sse_once_match;
 use core_test_support::responses::sse;
+use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
@@ -26,6 +30,13 @@ use serde_json::json;
 use std::time::Duration;
 use tokio::time::Instant;
 use tokio::time::sleep;
+use wiremock::Mock;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
+
+#[path = "multi_agent_restore_tests.rs"]
+mod restore_tests;
 
 const COLLABORATION_NAMESPACE: &str = "collaboration";
 const SPAWN_CALL_ID: &str = "spawn-worker";
@@ -145,7 +156,8 @@ fn configure_multi_agent_v2_with_role(
         .expect("test config should allow feature update");
     config.multi_agent_v2.subagent_developer_instructions =
         Some(SUBAGENT_DEVELOPER_INSTRUCTIONS.to_string());
-    config.multi_agent_v2.max_concurrent_threads_per_session = 3;
+    // Keep the root, worker, grandchild, and sibling resident until explicit shutdown.
+    config.multi_agent_v2.max_concurrent_threads_per_session = 4;
     let role_path = config.codex_home.join("durable-worker-role.toml");
     std::fs::write(
         &role_path,
@@ -217,17 +229,37 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
         sse(vec![ev_completed("resp-parent-turn-assistant")]),
     )
     .await;
-    for (text, is_subagent) in [(NESTED_CALL_ID, true), (QUEUE_CALL_ID, false)] {
-        mount_sse_once_match(
-            &server,
-            move |request: &wiremock::Request| {
-                body_contains(request, text)
-                    && request_has_input_type(request, "agent_message") == is_subagent
-            },
-            sse(vec![ev_completed("resp-parent-turn-assistant")]),
-        )
+    // The grandchild's completion can arrive during the worker's completion response,
+    // causing one more sampling request to drain that message before the turn ends.
+    let worker_completion = wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/responses"))
+        .and(|request: &wiremock::Request| {
+            decoded_body(request)
+                .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+                .is_some_and(|body| {
+                    body["input"].as_array().is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item["type"] == "function_call_output"
+                                && item["call_id"] == NESTED_CALL_ID
+                        })
+                    })
+                })
+        })
+        .respond_with(sse_response(sse(vec![ev_completed(
+            "resp-worker-complete",
+        )])))
+        .expect(1..=2)
+        .mount_as_scoped(&server)
         .await;
-    }
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            body_contains(request, QUEUE_CALL_ID)
+                && !request_has_input_type(request, "agent_message")
+        },
+        sse(vec![ev_completed("resp-parent-turn-assistant")]),
+    )
+    .await;
     mount_sse_once_match(
         &server,
         |request: &wiremock::Request| {
@@ -247,6 +279,7 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
     });
     let initial = initial_builder.build_with_auto_env(&server).await?;
     let root_thread_id = initial.session_configured.thread_id;
+    let root_session_id = initial.session_configured.session_id;
     initial
         .codex
         .start_or_steer_turn(
@@ -367,10 +400,21 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
     sibling_thread.flush_rollout().await?;
     worker_thread.flush_rollout().await?;
     initial.codex.flush_rollout().await?;
+    let worker_created_at = initial
+        .thread_store
+        .read_thread(ReadThreadParams {
+            thread_id: worker_thread_id,
+            include_archived: true,
+            include_history: false,
+        })
+        .await?
+        .created_at
+        .timestamp();
     sibling_thread.shutdown_and_wait().await?;
     worker_thread.shutdown_and_wait().await?;
     drop(sibling_thread);
     drop(worker_thread);
+    drop(worker_completion);
 
     let followup_args = serde_json::to_string(&json!({
         "target": "worker",
@@ -419,11 +463,34 @@ async fn cold_root_resume_restores_agent_identity_and_role_on_followup() -> Resu
     )
     .await;
 
+    Mock::given(method("POST"))
+        .and(path("/codex/analytics-events/events"))
+        .respond_with(ResponseTemplate::new(/* status */ 200))
+        .mount(&server)
+        .await;
+    let analytics_client = AnalyticsEventsClient::new(
+        codex_core::test_support::auth_manager_from_auth(
+            CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+        ),
+        server.uri(),
+        /* analytics_enabled */ Some(true),
+    );
     let resumed_model_provider_base_url = format!("{}/v1", server.uri());
-    let mut resume_builder = test_codex().with_config(move |config| {
-        configure_multi_agent_v2_with_role(config, &resumed_model_provider_base_url);
-    });
+    let mut resume_builder = test_codex()
+        .with_analytics_events_client(analytics_client.clone())
+        .with_config(move |config| {
+            configure_multi_agent_v2_with_role(config, &resumed_model_provider_base_url);
+            config.analytics_enabled = Some(true);
+        });
     let resumed = resume_builder.restart(&server, &initial).await?;
+    resumed
+        .codex
+        .set_app_server_client_info(
+            Some("resume-test".to_string()),
+            Some("1.0.0".to_string()),
+            /*mcp_elicitations_auto_deny*/ false,
+        )
+        .await?;
     drop(initial);
     assert_eq!(
         resumed.thread_manager.list_thread_ids().await,
@@ -511,6 +578,44 @@ openai_base_url = "{redirected_base_url}"
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
+    tokio::time::timeout(Duration::from_secs(10), analytics_client.flush()).await?;
+    let mut worker_initializations = Vec::new();
+    for request in server.received_requests().await.unwrap_or_default() {
+        if request.url.path() != "/codex/analytics-events/events" {
+            continue;
+        }
+        let payload: Value = serde_json::from_slice(&request.body)?;
+        worker_initializations.extend(
+            payload["events"]
+                .as_array()
+                .expect("analytics events")
+                .iter()
+                .filter(|event| {
+                    event["event_type"] == "codex_thread_initialized"
+                        && event["event_params"]["thread_id"] == worker_thread_id.to_string()
+                })
+                .map(|event| {
+                    let params = &event["event_params"];
+                    json!({
+                        "session_id": params["session_id"],
+                        "parent_thread_id": params["parent_thread_id"],
+                        "subagent_source": params["subagent_source"],
+                        "initialization_mode": params["initialization_mode"],
+                        "created_at": params["created_at"],
+                    })
+                }),
+        );
+    }
+    assert_eq!(
+        worker_initializations,
+        vec![json!({
+            "session_id": root_session_id.to_string(),
+            "parent_thread_id": root_thread_id.to_string(),
+            "subagent_source": "thread_spawn",
+            "initialization_mode": "resumed",
+            "created_at": worker_created_at,
+        })]
+    );
     assert!(followup_child_request.requests().iter().any(|request| {
         request.body_contains_text(FOLLOWUP_TASK)
             && request.body_contains_text(ROLE_DEVELOPER_INSTRUCTIONS)

@@ -20,11 +20,12 @@ mod windows_tests;
 pub(super) fn find_python() -> Option<String> {
     for candidate in ["python3", "python"] {
         if let Ok(output) = std::process::Command::new(candidate)
-            .arg("--version")
+            .args(["-c", "import sys; print(sys.executable)"])
+            .env("PYTHONIOENCODING", "utf-8")
             .output()
             && output.status.success()
         {
-            return Some(candidate.to_string());
+            return Some(String::from_utf8(output.stdout).ok()?.trim().to_owned());
         }
     }
     None
@@ -362,7 +363,7 @@ async fn pty_python_repl_emits_output_and_exits() -> anyhow::Result<()> {
         &env_map,
         &None,
         TerminalSize::default(),
-        &[],
+        crate::ChildFds::Inherited(&[]),
     )
     .await?;
     let (session, mut output_rx, exit_rx) = combine_spawned_output(spawned);
@@ -507,7 +508,7 @@ async fn pipe_and_pty_share_interface() -> anyhow::Result<()> {
         &env_map,
         &None,
         TerminalSize::default(),
-        &[],
+        crate::ChildFds::Inherited(&[]),
     )
     .await?;
     let (_pipe_session, pipe_output_rx, pipe_exit_rx) = combine_spawned_output(pipe);
@@ -919,7 +920,7 @@ time.sleep(10)
             &env_map,
             &None,
             TerminalSize::default(),
-            inherited_fds,
+            crate::ChildFds::Inherited(inherited_fds),
         )
         .await?;
         let (session, mut output_rx, exit_rx) = combine_spawned_output(spawned);
@@ -987,7 +988,7 @@ fn pty_spawn_without_io_driver_returns_error() -> anyhow::Result<()> {
             &env_map,
             &None,
             TerminalSize::default(),
-            inherited_fds,
+            crate::ChildFds::Inherited(inherited_fds),
         )) else {
             anyhow::bail!("PTY spawn succeeded without a Tokio I/O driver");
         };
@@ -1060,7 +1061,7 @@ fn pty_terminate_allows_runtime_shutdown_with_full_output_channel() -> anyhow::R
                 &env_map,
                 &None,
                 TerminalSize::default(),
-                inherited_fds,
+                crate::ChildFds::Inherited(inherited_fds),
             )
             .await?;
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -1124,7 +1125,7 @@ async fn pty_dropped_output_receiver_keeps_draining_child() -> anyhow::Result<()
             &env_map,
             &None,
             TerminalSize::default(),
-            inherited_fds,
+            crate::ChildFds::Inherited(inherited_fds),
         )
         .await?;
         drop(stdout_rx);
@@ -1154,33 +1155,37 @@ assert data == b'0123456789abcdefghijklmnopqrstuvwxyz\n' * 32768 + b'\n', len(da
 print('__complete__', flush=True)
 ";
     let env_map: HashMap<String, String> = std::env::vars().collect();
-    let spawned = spawn_pty_process(
-        &python,
-        &["-c".to_string(), script.to_string()],
-        Path::new("."),
-        &env_map,
-        &None,
-        TerminalSize::default(),
-        &[],
-    )
-    .await?;
-    let (session, mut output_rx, exit_rx) = combine_spawned_output(spawned);
-    wait_for_output_contains(&mut output_rx, "__ready__", /*timeout_ms*/ 2_000).await?;
-    let writer = session.writer_sender();
-    writer
-        .send(b"0123456789abcdefghijklmnopqrstuvwxyz\n".repeat(32_768))
+    use std::os::fd::AsRawFd;
+    let reader = std::fs::File::open("/dev/null")?;
+    for fds in [&[][..], &[reader.as_raw_fd()][..]] {
+        let spawned = spawn_pty_process(
+            &python,
+            &["-c".to_string(), script.to_string()],
+            Path::new("."),
+            &env_map,
+            &None,
+            TerminalSize::default(),
+            crate::ChildFds::Attached(fds),
+        )
         .await?;
-    drop(writer);
-    session.close_stdin();
+        let (session, mut output_rx, exit_rx) = combine_spawned_output(spawned);
+        wait_for_output_contains(&mut output_rx, "__ready__", /*timeout_ms*/ 2_000).await?;
+        let writer = session.writer_sender();
+        writer
+            .send(b"0123456789abcdefghijklmnopqrstuvwxyz\n".repeat(32_768))
+            .await?;
+        drop(writer);
+        session.close_stdin();
 
-    let (output, code) = collect_output_until_exit(output_rx, exit_rx, /*timeout_ms*/ 5_000).await;
-    // FreeBSD may ring the terminal bell while the canonical input queue is
-    // full. The child still verifies every input byte before reporting success.
-    let output = String::from_utf8_lossy(&output);
-    assert_eq!(
-        (code, output.trim_start_matches('\u{7}').trim()),
-        (0, "__complete__")
-    );
+        let (output, code) =
+            collect_output_until_exit(output_rx, exit_rx, /*timeout_ms*/ 5_000).await;
+        let output = String::from_utf8_lossy(&output);
+        // FreeBSD may ring the terminal bell while the canonical input queue is
+        // full. The child still verifies every input byte before reporting success.
+        #[cfg(target_os = "freebsd")]
+        let output = output.trim_start_matches('\u{7}');
+        assert_eq!((code, output.trim()), (0, "__complete__"));
+    }
     Ok(())
 }
 
@@ -1222,7 +1227,7 @@ fn pty_terminate_reaps_child_when_waiter_is_queued() -> anyhow::Result<()> {
             &env_map,
             &None,
             TerminalSize::default(),
-            &[],
+            crate::ChildFds::Inherited(&[]),
         )
         .await?;
         let (session, _output_rx, exit_rx) = combine_spawned_output(spawned);
@@ -1273,6 +1278,58 @@ fn pty_terminate_reaps_child_when_waiter_is_queued() -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn pty_attachments_preserve_shell_environment_and_signal_status() -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd;
+    let reader = std::fs::File::open("/dev/null")?;
+    let fds = [reader.as_raw_fd()];
+    let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFD) };
+    assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+    let python = find_python().expect("python required for descriptor test");
+    let script = r"import os, signal, sys
+if len(sys.argv) > 1:
+    try:
+        os.fstat(int(sys.argv[1]))
+    except OSError:
+        sys.exit(42)
+if 'SHELL' in os.environ:
+    print(os.environ['SHELL'], flush=True)
+os.kill(os.getpid(), signal.SIGTERM)
+";
+    let mut output = Vec::new();
+    for (fds, expected_status) in [
+        (crate::ChildFds::Inherited(&[]), 1),
+        (crate::ChildFds::Attached(&fds), 1),
+        (crate::ChildFds::Inherited(&fds), 143),
+    ] {
+        let mut args = vec!["-c".to_string(), script.to_string()];
+        args.extend(fds.as_slice().iter().map(ToString::to_string));
+        let spawned = spawn_pty_process(
+            &python,
+            &args,
+            Path::new("/"),
+            &HashMap::new(),
+            &None,
+            TerminalSize::default(),
+            fds,
+        )
+        .await?;
+        assert_eq!(
+            unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFD) },
+            flags
+        );
+        let (_session, output_rx, exit_rx) = combine_spawned_output(spawned);
+        let (bytes, status) =
+            collect_output_until_exit(output_rx, exit_rx, /*timeout_ms*/ 2_000).await;
+        assert_eq!(status, expected_status);
+        output.push(bytes);
+    }
+    assert!(!output[0].is_empty());
+    assert_eq!(output[0], output[1]);
+    Ok(())
+}
+
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pty_terminate_kills_background_children_in_same_process_group() -> anyhow::Result<()> {
     let env_map: HashMap<String, String> = std::env::vars().collect();
@@ -1286,7 +1343,7 @@ async fn pty_terminate_kills_background_children_in_same_process_group() -> anyh
         &env_map,
         &None,
         TerminalSize::default(),
-        &[],
+        crate::ChildFds::Inherited(&[]),
     )
     .await?;
     let (session, mut output_rx, exit_rx) = combine_spawned_output(spawned);
@@ -1346,20 +1403,8 @@ async fn pty_spawn_can_preserve_inherited_fds() -> anyhow::Result<()> {
         write_end.as_raw_fd().to_string(),
     );
 
-    let python = find_python().expect("python required for inherited descriptor test");
-    env_map.insert(
-        "UNPRESERVED_FD".to_string(),
-        read_end.as_raw_fd().to_string(),
-    );
-    let script = r"import errno, os
-try:
-    os.fstat(int(os.environ['UNPRESERVED_FD']))
-except OSError as error:
-    assert error.errno == errno.EBADF
-else:
-    raise AssertionError('unrequested descriptor survived exec')
-os.write(int(os.environ['PRESERVED_FD']), b'__preserved__')
-";
+    let python = find_python().expect("python required for descriptor test");
+    let script = "import os; os.write(int(os.environ['PRESERVED_FD']), b'__preserved__')";
     let spawned = spawn_pty_process(
         &python,
         &["-c".to_string(), script.to_string()],
@@ -1367,7 +1412,7 @@ os.write(int(os.environ['PRESERVED_FD']), b'__preserved__')
         &env_map,
         &None,
         TerminalSize::default(),
-        &[write_end.as_raw_fd()],
+        crate::ChildFds::Inherited(&[write_end.as_raw_fd()]),
     )
     .await?;
 
@@ -1419,7 +1464,7 @@ async fn pty_preserving_inherited_fds_keeps_python_repl_running() -> anyhow::Res
         &env_map,
         &None,
         TerminalSize::default(),
-        &[preserved_fd.as_raw_fd()],
+        crate::ChildFds::Inherited(&[preserved_fd.as_raw_fd()]),
     )
     .await?;
     drop(read_end);
@@ -1485,7 +1530,7 @@ async fn pty_spawn_with_inherited_fds_reports_exec_failures() -> anyhow::Result<
         &env_map,
         &None,
         TerminalSize::default(),
-        &[write_end.as_raw_fd()],
+        crate::ChildFds::Inherited(&[write_end.as_raw_fd()]),
     )
     .await;
 
@@ -1537,7 +1582,7 @@ async fn pty_spawn_with_inherited_fds_supports_resize() -> anyhow::Result<()> {
             rows: 31,
             cols: 101,
         },
-        &[write_end.as_raw_fd()],
+        crate::ChildFds::Inherited(&[write_end.as_raw_fd()]),
     )
     .await?;
 
@@ -1597,20 +1642,8 @@ async fn pipe_spawn_no_stdin_can_preserve_inherited_fds() -> anyhow::Result<()> 
         write_end.as_raw_fd().to_string(),
     );
 
-    let python = find_python().expect("python required for inherited descriptor test");
-    env_map.insert(
-        "UNPRESERVED_FD".to_string(),
-        read_end.as_raw_fd().to_string(),
-    );
-    let script = r"import errno, os
-try:
-    os.fstat(int(os.environ['UNPRESERVED_FD']))
-except OSError as error:
-    assert error.errno == errno.EBADF
-else:
-    raise AssertionError('unrequested descriptor survived exec')
-os.write(int(os.environ['PRESERVED_FD']), b'__pipe_preserved__')
-";
+    let python = find_python().expect("python required for descriptor test");
+    let script = "import os; os.write(int(os.environ['PRESERVED_FD']), b'__pipe_preserved__')";
     let spawned = spawn_pipe_process_no_stdin(
         &python,
         &["-c".to_string(), script.to_string()],
@@ -1633,6 +1666,10 @@ os.write(int(os.environ['PRESERVED_FD']), b'__pipe_preserved__')
 
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+#[path = "spawn_helper_tests.rs"]
+pub(crate) mod spawn_helper_tests;
 
 #[cfg(target_os = "freebsd")]
 #[tokio::test]
@@ -1668,7 +1705,7 @@ print('__closed__')
             &env_map,
             &None,
             TerminalSize::default(),
-            &[],
+            crate::ChildFds::Inherited(&[]),
         )
         .await?,
     ];

@@ -20,6 +20,7 @@ use codex_app_server_client::AppServerEvent;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::UserInput;
@@ -268,6 +269,7 @@ async fn check_thread_title_generation(scenario: TitleScenario) -> color_eyre::R
         .turns
         .push(Turn {
             id: "existing-turn".to_string(),
+            root_turn_id: None,
             items: vec![title_user_message("user-message", "Fix the login timeout")],
             items_view: Default::default(),
             status: TurnStatus::Completed,
@@ -295,7 +297,20 @@ async fn check_thread_title_generation(scenario: TitleScenario) -> color_eyre::R
             .await?;
         }
         assert_eq!(app.chat_widget.thread_name(), None);
-        assert!(render_bottom_popup(&app.chat_widget, /*width*/ 120).contains('⠋'));
+        if matches!(scenario, TitleScenario::Automatic) {
+            app.chat_widget.refresh_status_surfaces();
+            insta::assert_snapshot!(
+                "automatic_thread_title_pending",
+                normalize_snapshot_paths(format!(
+                    "terminal title: {}\nfooter:\n{}",
+                    app.chat_widget
+                        .last_terminal_title
+                        .as_deref()
+                        .unwrap_or_default(),
+                    render_bottom_popup(&app.chat_widget, /*width*/ 120)
+                ))
+            );
+        }
         assert_eq!(
             app_server
                 .thread_read(thread_id, /*include_turns*/ false)
@@ -312,7 +327,7 @@ async fn check_thread_title_generation(scenario: TitleScenario) -> color_eyre::R
 
     enum TitleDriveEvent {
         Ui(Box<AppEvent>),
-        Server(AppServerEvent),
+        Server(crate::app_server_session::AppServerSessionEvent),
         RequestStarted,
     }
 
@@ -345,13 +360,22 @@ async fn check_thread_title_generation(scenario: TitleScenario) -> color_eyre::R
                 app.handle_event(&mut tui, &mut app_server, *event).await?;
             }
             TitleDriveEvent::Server(event) => {
-                if let AppServerEvent::ServerNotification(notification) = &event
+                if let AppServerEvent::ServerNotification(notification) = &event.event
+                    && let ServerNotification::ThreadStarted(started) = notification.as_ref()
+                    && started.thread.ephemeral
+                {
+                    assert_eq!(
+                        started.thread.thread_source,
+                        Some(ThreadSource::Feature("thread_title".to_string())),
+                    );
+                }
+                if let AppServerEvent::ServerNotification(notification) = &event.event
                     && let ServerNotification::TurnCompleted(completed) = notification.as_ref()
                     && Some(&completed.thread_id) == temporary_thread_id.as_ref()
                 {
                     interrupted = completed.turn.status == TurnStatus::Interrupted;
                 }
-                app.handle_app_server_event(&app_server, event).await;
+                app.handle_backend_event(&app_server, event).await;
             }
             TitleDriveEvent::RequestStarted => {
                 let name = "Keep this title".to_string();
@@ -368,7 +392,6 @@ async fn check_thread_title_generation(scenario: TitleScenario) -> color_eyre::R
                 assert!(app.pending_thread_titles.is_empty());
                 let popup = render_bottom_popup(&app.chat_widget, /*width*/ 120);
                 assert!(popup.contains("Keep this title"));
-                assert!(!popup.contains('⠋'));
                 if matches!(scenario, TitleScenario::ManualRename) {
                     insta::assert_snapshot!(
                         "manual_rename_cancels_thread_title",
@@ -415,7 +438,6 @@ async fn check_thread_title_generation(scenario: TitleScenario) -> color_eyre::R
     }
     assert!(app.temporary_structured_requests.is_empty());
     assert!(app.pending_thread_titles.is_empty());
-    assert!(!render_bottom_popup(&app.chat_widget, /*width*/ 120).contains('⠋'));
 
     let request = response.single_request();
     assert!(
@@ -443,7 +465,6 @@ async fn canceled_thread_title_ignores_late_start_and_completion() -> color_eyre
     let destination = ThreadTitleDestination::Automatic;
     app.pending_thread_titles
         .insert((thread_id, destination), cancellation.clone());
-    app.sync_thread_title_progress();
 
     app.try_submit_active_thread_op_via_app_server(
         &mut app_server,
@@ -744,11 +765,8 @@ fn title_agent_message(id: &str, text: &str, phase: Option<MessagePhase>) -> Thr
 }
 
 #[tokio::test]
-async fn thread_title_progress_clears_failed_requests_and_follows_thread_switches()
--> color_eyre::Result<()> {
+async fn failed_thread_title_requests_are_removed() -> color_eyre::Result<()> {
     let mut app = make_test_app().await;
-    app.local_settings.tui.animations = false;
-    app.chat_widget.local_settings.tui.animations = false;
     let mut app_server = crate::start_embedded_app_server_for_picker(&app.config).await?;
     let started = app_server.start_thread(&app.config).await?;
     let thread_id = started.session.thread_id;
@@ -764,8 +782,6 @@ async fn thread_title_progress_clears_failed_requests_and_follows_thread_switche
         ),
         ((thread_id, suggestion), CancellationToken::new()),
     ]);
-    app.sync_thread_title_progress();
-    assert!(render_bottom_popup(&app.chat_widget, /*width*/ 120).contains('⠋'));
 
     app.on_thread_title_started(
         &app_server,
@@ -776,7 +792,6 @@ async fn thread_title_progress_clears_failed_requests_and_follows_thread_switche
         Err("startup failed".to_string()),
         CancellationToken::new(),
     );
-    assert!(render_bottom_popup(&app.chat_widget, /*width*/ 120).contains('⠋'));
     app.on_thread_title_started(
         &app_server,
         thread_id,
@@ -787,34 +802,12 @@ async fn thread_title_progress_clears_failed_requests_and_follows_thread_switche
         CancellationToken::new(),
     );
     assert!(app.pending_thread_titles.is_empty());
-    assert!(!render_bottom_popup(&app.chat_widget, /*width*/ 120).contains('⠋'));
 
     let mut tui = crate::tui::test_support::make_test_tui()?;
     app.pending_thread_titles.insert(
         (thread_id, ThreadTitleDestination::Automatic),
         CancellationToken::new(),
     );
-    let second = app_server.start_thread(&app.config).await?;
-    let second_id = second.session.thread_id;
-    app.ensure_thread_channel(second_id)
-        .store
-        .lock()
-        .await
-        .set_session(second.session, second.turns);
-    app.select_agent_thread(&mut tui, &mut app_server, second_id)
-        .await?;
-    app.render_chat_widget_frame(
-        &mut tui,
-        ratatui::layout::Size::new(/*width*/ 120, /*height*/ 30),
-    )?;
-    assert!(!render_bottom_popup(&app.chat_widget, /*width*/ 120).contains('⠋'));
-    app.select_agent_thread(&mut tui, &mut app_server, thread_id)
-        .await?;
-    app.render_chat_widget_frame(
-        &mut tui,
-        ratatui::layout::Size::new(/*width*/ 120, /*height*/ 30),
-    )?;
-    assert!(render_bottom_popup(&app.chat_widget, /*width*/ 120).contains('⠋'));
     app.handle_event(
         &mut tui,
         &mut app_server,
@@ -828,7 +821,6 @@ async fn thread_title_progress_clears_failed_requests_and_follows_thread_switche
     )
     .await?;
     assert!(app.pending_thread_titles.is_empty());
-    assert!(!render_bottom_popup(&app.chat_widget, /*width*/ 120).contains('⠋'));
     app_server.shutdown().await?;
     Ok(())
 }

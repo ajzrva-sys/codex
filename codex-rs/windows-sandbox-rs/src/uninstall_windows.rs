@@ -5,6 +5,10 @@ use std::path::Path;
 
 use anyhow::Result;
 use anyhow::anyhow;
+use anyhow::ensure;
+use windows::Win32::System::Com::COINIT_MULTITHREADED;
+use windows::Win32::System::Com::CoInitializeEx;
+use windows::Win32::System::Com::CoUninitialize;
 
 use crate::setup::OFFLINE_USERNAME;
 use crate::setup::ONLINE_USERNAME;
@@ -14,14 +18,38 @@ mod principals;
 mod processes;
 mod retained_logons;
 
+/// Removes machine-wide legacy sandbox resources without reading or changing Codex home.
+pub fn clean_up_legacy_windows_sandbox() -> Result<()> {
+    ensure!(
+        crate::setup::is_elevated()?,
+        "sandbox cleanup requires administrator privileges"
+    );
+    let _setup_lock = crate::setup_mutex::acquire_sandbox_setup_lock(/*timeout_ms*/ 5_000)?;
+    // Retire the previous owner so future setup can use a different user or home.
+    crate::runtime_ownership::remove_installation()?;
+    unsafe {
+        CoInitializeEx(/*pvreserved*/ None, COINIT_MULTITHREADED).ok()?
+    };
+    // No home or desktop callback: retain all user files, including sandbox caches and ACLs.
+    let result = clean_up_packaged_windows_sandbox(
+        /*codex_home*/ None,
+        |message| eprintln!("{message}"),
+        || Ok(()),
+    );
+    unsafe { CoUninitialize() };
+    result
+}
+
 /// Removes sandbox resources created for one authenticated packaged installation.
 /// Keep a supplied home and its ancestors pinned until `clean_up_desktop` starts.
 /// That callback removes user-owned desktop files while the sandbox accounts remain disabled.
+/// `report` must remain usable after the home and its log files have been removed.
 pub fn clean_up_packaged_windows_sandbox(
     codex_home: Option<&Path>,
+    report: impl Fn(&str),
     clean_up_desktop: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    prepare_packaged_windows_sandbox_cleanup()?.finish(codex_home, clean_up_desktop)
+    prepare_packaged_windows_sandbox_cleanup()?.finish(codex_home, report, clean_up_desktop)
 }
 
 /// Holds the setup lock after sandbox accounts are disabled, their processes
@@ -86,9 +114,11 @@ impl PreparedWindowsSandboxCleanup {
     /// starts. Independent cleanup steps continue after an error, as in
     /// `clean_up_packaged_windows_sandbox`. Retrying keeps the original account
     /// identities; it must not adopt replacement accounts created between attempts.
+    /// `report` records each cleanup outcome without relying on files in the home.
     pub fn finish(
         &self,
         codex_home: Option<&Path>,
+        report: impl Fn(&str),
         clean_up_desktop: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
         self.users.validate_current()?;
@@ -98,37 +128,71 @@ impl PreparedWindowsSandboxCleanup {
             if let Err(error) = crate::logging::release_setup_log() {
                 errors.push(format!("release setup log: {error:#}"));
             }
-            for directory in [
-                crate::setup::sandbox_dir(codex_home),
-                crate::setup::sandbox_secrets_dir(codex_home),
-                crate::setup::sandbox_bin_dir(codex_home),
+            for (directory, path) in [
+                (".sandbox", crate::setup::sandbox_dir(codex_home)),
+                (
+                    ".sandbox-secrets",
+                    crate::setup::sandbox_secrets_dir(codex_home),
+                ),
+                (".sandbox-bin", crate::setup::sandbox_bin_dir(codex_home)),
             ] {
-                match std::fs::remove_dir_all(&directory) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                match std::fs::remove_dir_all(path) {
+                    Ok(()) => report(&format!("removed {directory}")),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        report(&format!("skipping {directory}: not found"));
+                    }
                     Err(error) => {
-                        errors.push(format!("remove {}: {error}", directory.display()));
+                        let message = format!("remove {directory}: failed, {error}");
+                        report(&message);
+                        errors.push(message);
                     }
                 }
             }
+        } else {
+            report("skipping sandbox directories: no pinned home");
         }
 
         if let Err(error) = clean_up_desktop() {
             errors.push(format!("{error:#}"));
         }
 
-        for result in [
-            crate::wfp::remove_wfp_filters(),
-            firewall::cleanup_firewall_rules(),
-            principals::remove_sandbox_principal("CodexSandboxUsers"),
-            crate::hide_users::unhide_sandbox_users(&[OFFLINE_USERNAME, ONLINE_USERNAME]),
-            // Keep accounts disabled and setup locked until shared cleanup and account deletion finish.
-            principals::remove_sandbox_principal(OFFLINE_USERNAME),
-            principals::remove_sandbox_principal(ONLINE_USERNAME),
+        for (operation, result) in [
+            ("remove WFP filters", crate::wfp::remove_wfp_filters()),
+            ("remove firewall rules", firewall::cleanup_firewall_rules()),
+            (
+                "remove hidden-user entries",
+                crate::hide_users::unhide_sandbox_users(&[OFFLINE_USERNAME, ONLINE_USERNAME]),
+            ),
         ] {
-            if let Err(error) = result {
-                errors.push(format!("{error:#}"));
+            match result {
+                Ok(()) => report(&format!("{operation}: completed")),
+                Err(error) => {
+                    let message = format!("{operation}: failed, {error:#}");
+                    report(&message);
+                    errors.push(message);
+                }
             }
+        }
+        if let Err(error) = self.users.remove_users(&self._retained_logons, &report) {
+            errors.push(format!("{error:#}"));
+        }
+        // Retry home permission cleanup with the same group; retained runtime users
+        // and their group are removed by the finalizer after their profiles unload.
+        if errors.is_empty()
+            && !self
+                .users
+                .sids()
+                .any(|sid| self._retained_logons.contains_sid(sid))
+        {
+            match principals::remove_sandbox_principal("CodexSandboxUsers") {
+                Ok(()) => report("remove sandbox group: completed"),
+                Err(error) => {
+                    report(&format!("remove sandbox group: failed, {error:#}"));
+                    errors.push(format!("{error:#}"));
+                }
+            }
+        } else {
+            report("retaining sandbox group until cleanup finishes");
         }
         if errors.is_empty() {
             Ok(())

@@ -19,3 +19,7 @@ workspace = true
 
 [lib]
 doctest = false
+
+[[bin]]
+name = "codex-freebsd-sandbox-client"
+path = "src/main.rs"

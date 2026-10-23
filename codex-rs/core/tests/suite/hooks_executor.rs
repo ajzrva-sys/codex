@@ -7,7 +7,7 @@ use codex_core::StartThreadOptions;
 use codex_core::TurnInputRequest;
 use codex_core::windows_sandbox::WindowsSandboxLevelExt;
 use codex_exec_server::CreateDirectoryOptions;
-use codex_exec_server::ExecServerRuntimePaths;
+use codex_exec_server::ExecServerRuntimeOptions;
 use codex_features::Feature;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
@@ -20,8 +20,11 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::protocol::ThreadSource;
+use codex_protocol::protocol::TurnEnvironmentRequest;
+use codex_protocol::protocol::TurnEnvironmentRequests;
 use codex_protocol::protocol::TurnEnvironmentSelection;
-use codex_protocol::protocol::TurnEnvironmentSelections;
+use codex_protocol::request_user_input::RequestUserInputAnswer;
+use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
 use codex_utils_path_uri::PathUri;
 use core_test_support::apps_test_server::AppsTestServer;
@@ -30,6 +33,7 @@ use core_test_support::apps_test_server::recorded_apps_tool_calls;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_response_sequence;
 use core_test_support::responses::sse;
@@ -40,12 +44,15 @@ use core_test_support::skip_if_remote;
 use core_test_support::submit_thread_settings;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::TestCodexBuilder;
+use core_test_support::test_codex::environment_config_for_selection;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
+use core_test_support::wait_for_event_match;
 use core_test_support::wait_for_mcp_server;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use test_case::test_case;
@@ -60,6 +67,74 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 
 use super::rmcp_client::remote_aware_environment_id;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn environment_requires_loadable_managed_hooks_at_startup_and_readiness() -> Result<()> {
+    let server = start_mock_server().await;
+    let test = test_codex()
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::CodexHooks)
+                .expect("enable hooks");
+            config
+                .features
+                .enable(Feature::DeferredExecutor)
+                .expect("allow the environment to start with pending configuration");
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    let mut selection = test.executor_environment().selection().clone();
+    let mut config = environment_config_for_selection(&test.config, &selection);
+    config.environment_hooks = toml::from_str(
+        r#"
+        [[PreToolUse]]
+        matcher = "["
+        [[PreToolUse.hooks]]
+        type = "command"
+        command = "echo managed-hook"
+        "#,
+    )?;
+    selection.config = EnvironmentConfigState::Ready(config.clone());
+    let start = |selection: TurnEnvironmentSelection| {
+        test.thread_manager.start_thread(StartThreadOptions {
+            environments: Some(vec![selection.into_request()]),
+            ..StartThreadOptions::new(test.config.clone())
+        })
+    };
+    let assert_invalid_matcher = |error: String| {
+        assert!(error.contains("invalid matcher"), "{error}");
+        assert!(error.contains(&selection.environment_id), "{error}");
+    };
+    let error = start(selection.clone())
+        .await
+        .err()
+        .context("startup accepted an invalid managed hook")?;
+    assert_invalid_matcher(error.to_string());
+
+    selection.config = EnvironmentConfigState::Pending;
+    let thread = start(selection.clone()).await?.thread;
+    let error = thread
+        .environment_ready(&selection, config.clone())
+        .await
+        .expect_err("an invalid managed hook must prevent readiness");
+    assert_invalid_matcher(error.to_string());
+    assert_eq!(
+        thread.environment_selections().await,
+        vec![selection.clone()]
+    );
+
+    config.environment_hooks.pre_tool_use[0].matcher = Some("^Bash$".to_string());
+    thread.environment_ready(&selection, config).await?;
+    assert!(
+        thread
+            .config_snapshot()
+            .await
+            .is_primary_environment_configured()
+    );
+    thread.shutdown_and_wait().await?;
+    Ok(())
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_plugin_selection_disables_executor_hooks_without_disabling_their_server()
@@ -110,6 +185,81 @@ async fn thread_plugin_selection_disables_executor_hooks_without_disabling_their
             .context("standalone tool call")?["params"]["name"],
         "js"
     );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn executor_stop_hook_uses_plugin_policy_refreshed_during_turn() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let fixture = executor_plugin_hook_fixture(
+        test_codex().with_config(|config| {
+            config
+                .features
+                .enable(Feature::DefaultModeRequestUserInput)
+                .expect("enable request_user_input");
+        }),
+        &[("computer-use@openai-bundled", computer_use_hook_manifest())],
+        vec![
+            sse_response(sse(vec![
+                ev_function_call(
+                    "pause",
+                    "request_user_input",
+                    r#"{"questions":[{"id":"continue","header":"Continue","question":"Continue?","options":[{"label":"Yes","description":"Finish."},{"label":"No","description":"Stop."}]}]}"#,
+                ),
+                ev_completed("paused-step"),
+            ])),
+            completed_turn_response("finished-turn"),
+        ],
+    )
+    .await?;
+    fixture.attach().await?;
+    fixture
+        .test
+        .codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Ask before finishing this turn".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    let request = wait_for_event_match(&fixture.test.codex, |event| match event {
+        EventMsg::RequestUserInput(request) => Some(request.clone()),
+        _ => None,
+    })
+    .await;
+
+    let current_config = fixture.test.codex.config().await;
+    let mut config = (*current_config).clone();
+    config.config_layer_stack = config.config_layer_stack.with_user_config(
+        &config.codex_home.join("config.toml"),
+        toml::from_str("[plugins._default]\nenabled = false")?,
+    )?;
+    let _ = fixture
+        .test
+        .codex
+        .refresh_runtime_config(current_config, config)
+        .await;
+    fixture
+        .test
+        .codex
+        .submit(Op::UserInputAnswer {
+            id: request.turn_id,
+            response: RequestUserInputResponse {
+                answers: HashMap::from([(
+                    "continue".to_string(),
+                    RequestUserInputAnswer {
+                        answers: vec!["Yes".to_string()],
+                    },
+                )]),
+            },
+        })
+        .await?;
+    wait_for_event(&fixture.test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    assert_eq!(fixture.responses.requests().len(), 2);
+    assert_eq!(fixture.calls().await?, Vec::<Value>::new());
     Ok(())
 }
 
@@ -288,7 +438,12 @@ async fn executor_stop_hook_stops_after_disconnection() -> Result<()> {
 async fn executor_stop_hook_rejects_mismatched_environment() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
-    let fixture = executor_stop_hook_fixture().await?;
+    let fixture = executor_hook_fixture(
+        ["first-turn", "switch-environments", "second-turn"]
+            .map(completed_turn_response)
+            .to_vec(),
+    )
+    .await?;
     let selection = fixture.attach().await?;
     fixture
         .test
@@ -304,7 +459,7 @@ async fn executor_stop_hook_rejects_mismatched_environment() -> Result<()> {
             let executor_address = listener.local_addr()?;
             let executor_url = format!("ws://{executor_address}");
             drop(listener);
-            let runtime_paths = ExecServerRuntimePaths::new(
+            let runtime_paths = ExecServerRuntimeOptions::new(
                 std::env::current_exe()?,
                 /*codex_linux_sandbox_exe*/ None,
             )?;
@@ -357,14 +512,14 @@ async fn executor_stop_hook_rejects_mismatched_environment() -> Result<()> {
     submit_thread_settings(
         &fixture.test.codex,
         ThreadSettingsOverrides {
-            environments: Some(TurnEnvironmentSelections::new(
+            environments: Some(TurnEnvironmentRequests::new(
                 fixture.test.config.cwd.clone(),
                 vec![
-                    attached_selection,
-                    TurnEnvironmentSelection {
+                    attached_selection.into_request(),
+                    TurnEnvironmentRequest {
                         environment_id: mismatched_environment_id.to_string(),
                         config: EnvironmentConfigState::FromThread,
-                        ..selection.clone()
+                        ..selection.clone().into_request()
                     },
                 ],
             )),
@@ -372,7 +527,13 @@ async fn executor_stop_hook_rejects_mismatched_environment() -> Result<()> {
         },
     )
     .await?;
+    fixture
+        .test
+        .submit_text_turn("apply the new executor environment")
+        .await?;
+    fixture.wait_for_hook_call().await?;
 
+    let current_config = fixture.test.codex.config().await;
     let mut mismatched_config = fixture.test.config.clone();
     let mut node_repl = mismatched_config
         .mcp_servers
@@ -386,12 +547,21 @@ async fn executor_stop_hook_rejects_mismatched_environment() -> Result<()> {
             .into_iter()
             .collect(),
     )?;
+    let _ = fixture
+        .test
+        .codex
+        .refresh_mcp_config(current_config, mismatched_config)
+        .await;
     fixture
         .test
         .codex
-        .refresh_mcp_config(mismatched_config)
-        .await;
-    wait_for_mcp_server(&fixture.test.codex, "node_repl").await?;
+        .call_mcp_tool(
+            "node_repl",
+            "js",
+            Some(json!({"code": "1 + 1"})),
+            /*meta*/ None,
+        )
+        .await?;
     assert_eq!(
         fixture
             .test
@@ -409,12 +579,21 @@ async fn executor_stop_hook_rejects_mismatched_environment() -> Result<()> {
         executor.abort();
     }
 
-    assert_eq!(fixture.calls().await?.len(), 1);
+    assert_eq!(
+        fixture
+            .calls()
+            .await?
+            .iter()
+            .filter(|call| call["params"]["name"] == "turn_ended")
+            .count(),
+        2
+    );
 
     Ok(())
 }
 
 #[test_case("Stop", "", "", 1; "enabled")]
+#[test_case("Interrupt", "", "", 1; "interrupt_enabled")]
 #[test_case("SubagentStop", "", "", 1; "subagent_enabled")]
 #[test_case(
     "Stop",
@@ -431,7 +610,7 @@ async fn executor_stop_hook_rejects_mismatched_environment() -> Result<()> {
     "managed_disabled"
 )]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn executor_browser_and_computer_use_stop_hooks_use_separate_mcp_routes(
+async fn executor_browser_and_computer_use_cleanup_hooks_use_separate_mcp_routes(
     hook_event: &'static str,
     user_config: &'static str,
     requirements: &'static str,
@@ -482,6 +661,12 @@ async fn executor_browser_and_computer_use_stop_hooks_use_separate_mcp_routes(
                         "tool": "browser.turn_ended",
                         "input": {},
                     }] }],
+                    "Interrupt": [{ "hooks": [{
+                        "type": "mcp_tool",
+                        "server": "codex_apps",
+                        "tool": "browser.turn_ended",
+                        "input": {},
+                    }] }],
                     "SubagentStop": [{ "hooks": [{
                         "type": "mcp_tool",
                         "server": "codex_apps",
@@ -503,7 +688,11 @@ async fn executor_browser_and_computer_use_stop_hooks_use_separate_mcp_routes(
                 CloudConfigBundleFixture::loader_with_enterprise_requirement(requirements),
             ),
         &plugins,
-        vec![completed_turn_response("browser-turn")],
+        vec![if hook_event == "Interrupt" {
+            completed_turn_response("browser-turn").set_delay(Duration::from_secs(60))
+        } else {
+            completed_turn_response("browser-turn")
+        }],
     )
     .await?;
     if hook_event == "SubagentStop" {
@@ -519,8 +708,7 @@ async fn executor_browser_and_computer_use_stop_hooks_use_separate_mcp_routes(
                     agent_role: None,
                 })),
                 thread_source: Some(ThreadSource::Subagent),
-                environments: Some(fixture.test.codex.environment_selections().await),
-                ..StartThreadOptions::new(fixture.test.config.clone())
+                ..fixture.test.start_thread_options().await
             })
             .await?;
         fixture.test.codex = child.thread;
@@ -540,7 +728,30 @@ async fn executor_browser_and_computer_use_stop_hooks_use_separate_mcp_routes(
             )
             .await?;
     }
-    fixture.test.submit_text_turn("finish browsing").await?;
+    if hook_event == "Interrupt" {
+        fixture
+            .test
+            .codex
+            .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "interrupt browsing".to_string(),
+                text_elements: Vec::new(),
+            }]))
+            .await?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while fixture.responses.requests().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("interrupted turn should reach the model request")?;
+        fixture.test.codex.submit(Op::Interrupt).await?;
+        wait_for_event(&fixture.test.codex, |event| {
+            matches!(event, EventMsg::TurnAborted(_))
+        })
+        .await;
+    } else {
+        fixture.test.submit_text_turn("finish browsing").await?;
+    }
     fixture.wait_for_hook_call().await?;
     let node_calls = fixture.calls().await?;
     let expected_node_tools = if hook_event == "SubagentStop" {
@@ -797,6 +1008,7 @@ impl ExecutorHookFixture {
             .environment_ready(
                 &selection,
                 EnvironmentConfig {
+                    environment_hooks: Default::default(),
                     allow_login_shell: false,
                     workspace_roots: selection.workspace_roots.clone(),
                     permission_profile: PermissionProfileSnapshot::legacy(
@@ -804,11 +1016,7 @@ impl ExecutorHookFixture {
                     ),
                     shell_environment_policy: Default::default(),
                     windows_sandbox_level: WindowsSandboxLevel::from_config(&self.test.config),
-                    windows_sandbox_private_desktop: self
-                        .test
-                        .config
-                        .permissions
-                        .windows_sandbox_private_desktop,
+                    windows_sandbox_type: self.test.config.permissions.windows_sandbox_type,
                     use_legacy_landlock: self.test.config.features.use_legacy_landlock(),
                     exec_policy: None,
                     mcp_policy: None,

@@ -3,10 +3,11 @@ use super::TRUSTED_SKILLS_PREFIX;
 use super::TrustedSkills;
 use codex_context_fragments::ContextualUserFragment;
 use codex_protocol::protocol::TruncationPolicy;
+use codex_protocol_test_support::ContentItemTestExt;
 use pretty_assertions::assert_eq;
 
 fn rendered_paths(paths: Vec<String>) -> Vec<String> {
-    let rendered = TrustedSkills { paths }.render();
+    let rendered = TrustedSkills { paths }.render().expect_text();
     assert!(rendered.len() <= TruncationPolicy::Tokens(MAX_TRUSTED_SKILL_TOKENS).byte_budget());
     serde_json::from_str(
         rendered
@@ -14,14 +15,6 @@ fn rendered_paths(paths: Vec<String>) -> Vec<String> {
             .expect("trusted skill context should contain JSON evidence"),
     )
     .expect("trusted skill evidence should remain valid JSON")
-}
-
-#[test]
-fn renders_verified_skill_paths() {
-    assert_eq!(
-        rendered_paths(vec!["/home/user/.codex/skills/demo/SKILL.md".to_owned()]),
-        vec!["/home/user/.codex/skills/demo/SKILL.md"],
-    );
 }
 
 #[test]

@@ -103,6 +103,25 @@ pub(crate) struct KeymapActionId {
 }
 
 impl KeymapActionId {
+    /// Whether two actions can be active together, including list-specific exceptions.
+    pub(super) fn overlaps(self, other: Self) -> bool {
+        use KeymapContext::Chat;
+        use KeymapContext::Global;
+        use KeymapContext::List;
+
+        match (self.context, other.context) {
+            // Presets cannot open while a list owns input.
+            (Chat, List) => self.action != "open_presets",
+            (List, Chat) => other.action != "open_presets",
+
+            // Activity focus and Find remain available during list navigation.
+            (Global, List) => matches!(self.action, "focus_activity" | "find_transcript"),
+            (List, Global) => matches!(other.action, "focus_activity" | "find_transcript"),
+
+            _ => self.context.overlaps(other.context),
+        }
+    }
+
     pub(crate) fn config_path(self) -> String {
         format!("tui.keymap.{}.{}", self.context.config_name(), self.action)
     }
@@ -123,8 +142,17 @@ macro_rules! runtime_group_mut {
     };
 }
 
+macro_rules! configured_binding_slot {
+    ($keymap:ident, $group:ident, $action:ident, runtime_only) => {
+        None
+    };
+    ($keymap:ident, $group:ident, $action:ident) => {
+        Some(&$keymap.$group.$action)
+    };
+}
+
 macro_rules! define_runtime_action_bindings {
-    ($($context:literal => $context_id:ident, $group:ident, $config_group:ident [$($action:ident),+ $(,)?]),+ $(,)?) => {
+    ($($context:literal => $context_id:ident, $group:ident, $config_group:ident [$($action:ident $(=> $runtime_only:ident)?),+ $(,)?]),+ $(,)?) => {
         /// Resolve a config context/action pair to its runtime identity.
         pub(crate) fn keymap_action_id(
             context: &str,
@@ -144,7 +172,7 @@ macro_rules! define_runtime_action_bindings {
         }
 
         /// Return the configured slot for one runtime action, including global fallbacks.
-        pub(super) fn configured_binding_for_action(
+        pub(crate) fn configured_binding_for_action(
             keymap: &TuiKeymap,
             action: KeymapActionId,
         ) -> Option<&Option<KeybindingsSpec>> {
@@ -161,7 +189,7 @@ macro_rules! define_runtime_action_bindings {
                 $(
                     $(
                         ($context, stringify!($action)) => {
-                            Some(&keymap.$config_group.$action)
+                            configured_binding_slot!(keymap, $config_group, $action $(, $runtime_only)?)
                         }
                     )+
                 )+
@@ -191,6 +219,7 @@ macro_rules! define_runtime_action_bindings {
             action: &str,
         ) -> Option<&'a [KeyBinding]> {
             match (context, action) {
+                ("global", "leader") => Some(runtime_keymap.chords.leader.as_slice()),
                 $(
                     $(
                         ($context, stringify!($action)) => {
@@ -251,6 +280,9 @@ define_runtime_action_bindings! {
     "global" => Global, app, global [
         open_agents,
         open_transcript,
+        find_transcript,
+        focus_activity,
+        open_warnings => runtime_only,
         open_external_editor,
         copy,
         clear_terminal,
@@ -260,6 +292,8 @@ define_runtime_action_bindings! {
         toggle_side_conversation,
     ],
     "chat" => Chat, chat, chat [
+        open_presets,
+        toggle_voice,
         interrupt_turn,
         decrease_reasoning_effort,
         increase_reasoning_effort,
@@ -379,6 +413,7 @@ define_runtime_action_bindings! {
         jump_bottom,
         close,
         close_transcript,
+        find,
     ],
     "list" => List, list, list [
         move_up,
@@ -397,11 +432,13 @@ define_runtime_action_bindings! {
         search,
         new_task,
         new_worktree,
+        fork,
         rename,
         stop,
         archive,
         delete,
         hide,
+        toggle_pin,
         toggle_grouping,
     ],
     "approval" => Approval, approval, approval [

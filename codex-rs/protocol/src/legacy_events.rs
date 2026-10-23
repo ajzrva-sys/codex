@@ -20,6 +20,8 @@ use crate::items::SubAgentActivityItem;
 use crate::items::TurnItem;
 use crate::items::UserMessageItem;
 use crate::items::WebSearchItem;
+use crate::items::trim_trailing_default_image_details;
+use crate::models::ImageReference;
 use crate::protocol::AgentMessageContentDeltaEvent;
 use crate::protocol::AgentMessageEvent;
 use crate::protocol::AgentReasoningEvent;
@@ -58,9 +60,12 @@ use crate::protocol::ReasoningContentDeltaEvent;
 use crate::protocol::ReasoningRawContentDeltaEvent;
 use crate::protocol::SubAgentActivityEvent;
 use crate::protocol::UserMessageEvent;
+use crate::protocol::UserMessageImageKind;
 use crate::protocol::ViewImageToolCallEvent;
 use crate::protocol::WebSearchBeginEvent;
 use crate::protocol::WebSearchEndEvent;
+use crate::user_input::UserInput;
+use codex_extension_items::image_generation::GeneratedImageRef;
 
 /// Converts canonical item lifecycle events back into the legacy raw event stream used by
 /// compatibility consumers that have not migrated to `TurnItem`.
@@ -78,11 +83,32 @@ impl UserMessageItem {
     pub fn as_legacy_user_message_event(&self) -> UserMessageEvent {
         // Legacy user-message events flatten only text inputs into `message` and
         // rebase text element ranges onto that concatenated text.
+        let mut file_ids = Vec::new();
+        let mut file_id_details = Vec::new();
+        let mut image_order = Vec::new();
+        for input in &self.content {
+            if let UserInput::Image { image, detail } = input {
+                match image {
+                    ImageReference::Inline { .. } => {
+                        image_order.push(UserMessageImageKind::Inline);
+                    }
+                    ImageReference::File { file_id } => {
+                        image_order.push(UserMessageImageKind::File);
+                        file_ids.push(file_id.clone());
+                        file_id_details.push(*detail);
+                    }
+                }
+            }
+        }
+        let file_id_details = trim_trailing_default_image_details(file_id_details);
         UserMessageEvent {
             client_id: self.client_id.clone(),
             message: self.message(),
             images: Some(self.image_urls()),
             image_details: self.image_details(),
+            file_ids: (!file_ids.is_empty()).then_some(file_ids),
+            file_id_details,
+            image_order,
             local_images: self.local_image_paths(),
             local_image_details: self.local_image_details(),
             audio: Some(self.audio_urls()),
@@ -197,12 +223,9 @@ impl CommandExecutionItem {
             parsed_cmd: self.parsed_cmd.clone(),
             source: self.source,
             interaction_input: self.interaction_input.clone(),
-            stdout: self.stdout.clone().unwrap_or_default(),
-            stderr: self.stderr.clone().unwrap_or_default(),
             aggregated_output: self.aggregated_output.clone().unwrap_or_default(),
             exit_code: self.exit_code.unwrap_or_default(),
             duration: self.duration.unwrap_or_default(),
-            formatted_output: self.formatted_output.clone().unwrap_or_default(),
             status,
         }))
     }
@@ -413,6 +436,8 @@ impl CollabAgentToolCallItem {
 impl SubAgentActivityItem {
     pub(crate) fn as_legacy_event(&self, occurred_at_ms: i64) -> EventMsg {
         EventMsg::SubAgentActivity(SubAgentActivityEvent {
+            model: self.model.clone(),
+            reasoning_effort: self.reasoning_effort.clone(),
             event_id: self.id.clone(),
             occurred_at_ms,
             agent_thread_id: self.agent_thread_id,
@@ -439,10 +464,13 @@ impl ImageGenerationItem {
             call_id: self.id.clone(),
             status: self.status.clone(),
             revised_prompt: self.revised_prompt.clone(),
-            result: self.result.clone(),
+            image: GeneratedImageRef::Inline {
+                result: self.result.clone(),
+            },
             transparent_background: None,
             failure: None,
             saved_path: self.saved_path.clone(),
+            input_images: Vec::new(),
         })
     }
 }
@@ -483,6 +511,7 @@ impl McpToolCallItem {
             },
             connector_id: self.connector_id.clone(),
             mcp_app_resource_uri: self.mcp_app_resource_uri.clone(),
+            mcp_app_ui: self.mcp_app_ui.clone(),
             link_id: self.link_id.clone(),
             app_name: self.app_name.clone(),
             action_name: self.action_name.clone(),
@@ -507,6 +536,7 @@ impl McpToolCallItem {
                 arguments: (!self.arguments.is_null()).then(|| self.arguments.clone()),
             },
             mcp_app_resource_uri: self.mcp_app_resource_uri.clone(),
+            mcp_app_ui: self.mcp_app_ui.clone(),
             connector_id: self.connector_id.clone(),
             link_id: self.link_id.clone(),
             app_name: self.app_name.clone(),

@@ -35,9 +35,11 @@ async fn experimental_features_use_selected_server_profile_and_preserve_task_set
         /*log_db*/ None,
         /*state_db*/ None,
         Arc::new(EnvironmentManager::default_for_tests()),
+        Default::default(),
     ))
     .await?;
     let mut server = AppServerSession::new(
+        crate::backend_id::BackendId::new(),
         AppServerClient::InProcess(client),
         crate::app_server_session::ThreadParamsMode::Remote,
     );
@@ -87,7 +89,7 @@ async fn experimental_features_use_selected_server_profile_and_preserve_task_set
         app.transcript_cells
             .last()
             .unwrap()
-            .display_lines(/*width*/ 120)
+            .transcript_lines(/*width*/ 120)
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>()

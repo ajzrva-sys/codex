@@ -1,29 +1,32 @@
 use super::*;
+use crate::test_support::boxed_future;
+use codex_app_server_protocol::GeneratedImageRef;
 use codex_app_server_protocol::ImageGenerationItem;
 use codex_app_server_protocol::PluginAvailability;
 use codex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
 
-pub(super) async fn test_config() -> Config {
+pub(super) async fn test_config() -> (tempfile::TempDir, Config) {
     // Start from the built-in defaults so tests do not inherit host/system config.
     let codex_home = tempfile::Builder::new()
         .prefix("chatwidget-tests-")
         .tempdir()
-        .expect("tempdir")
-        .keep();
-    let mut config =
-        Config::load_default_with_cli_overrides_for_codex_home(codex_home.clone(), Vec::new())
-            .await
-            .expect("config");
+        .expect("tempdir");
+    let mut config = Config::load_default_with_cli_overrides_for_codex_home(
+        codex_home.path().to_path_buf(),
+        Vec::new(),
+    )
+    .await
+    .expect("config");
     // Keep generic UI snapshots stable when the bundled catalog default changes.
     config.model = Some("gpt-5.6-sol".to_string());
-    config.codex_home = codex_home.abs();
-    config.sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.as_path().abs());
-    config.log_dir = codex_home.join("log");
+    config.codex_home = codex_home.path().abs();
+    config.sqlite = codex_state::SqliteConfig::new_for_testing(codex_home.path().abs());
+    config.log_dir = codex_home.path().join("log");
     config.cwd = PathBuf::from(test_path_display("/tmp/project")).abs();
     config.config_layer_stack = ConfigLayerStack::default();
     config.startup_warnings.clear();
-    config
+    (codex_home, config)
 }
 
 pub(super) fn test_project_path() -> PathBuf {
@@ -65,6 +68,44 @@ pub(crate) fn normalize_snapshot_paths(text: impl Into<String>) -> String {
 
         text
     }
+}
+
+/// Normalize command-center fixture paths without moving fixed pane separators.
+/// Pad after each complete pane so group counts and destination hints keep their spacing.
+pub(crate) fn normalize_agent_center_snapshot(text: impl AsRef<str>) -> String {
+    text.as_ref()
+        .split('\n')
+        .map(|line| {
+            let quoted = line
+                .strip_prefix('"')
+                .and_then(|line| line.strip_suffix('"'));
+            let content = quoted.unwrap_or(line);
+            let normalized = content
+                .split('│')
+                .map(|pane| {
+                    let mut normalized = pane.to_owned();
+                    for unix_path in ["/tmp/second-project", "/tmp/project", "/project"] {
+                        // test_path_buf uses this drive for all absolute Windows fixtures.
+                        let windows_path = format!("C:{}", unix_path.replace('/', "\\"));
+                        normalized = normalized
+                            .replace(&windows_path, unix_path)
+                            .replace(&windows_path.replace('\\', "/"), unix_path);
+                    }
+                    // Only ASCII path bytes change, so this is also the removed cell width.
+                    let padding = pane.len().saturating_sub(normalized.len());
+                    normalized.push_str(&" ".repeat(padding));
+                    normalized
+                })
+                .collect::<Vec<_>>()
+                .join("│");
+            if quoted.is_some() {
+                format!("\"{normalized}\"")
+            } else {
+                normalized.trim_end().to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub(super) fn normalized_backend_snapshot<T: std::fmt::Display>(value: &T) -> String {
@@ -180,7 +221,7 @@ pub(super) async fn make_chatwidget_manual_with_auth(
     let (tx_raw, rx) = unbounded_channel::<AppEvent>();
     let app_event_tx = AppEventSender::new(tx_raw);
     let (op_tx, op_rx) = unbounded_channel::<Op>();
-    let mut cfg = test_config().await;
+    let (codex_home, mut cfg) = test_config().await;
     let resolved_model = model_override
         .map(str::to_owned)
         .unwrap_or_else(|| get_model_offline_for_tests(cfg.model.as_deref()));
@@ -212,6 +253,10 @@ pub(super) async fn make_chatwidget_manual_with_auth(
         session_telemetry,
     };
     let mut widget = ChatWidget::new_with_op_target(common, super::CodexOpTarget::Direct(op_tx));
+    widget.test_codex_home = Some(codex_home);
+    widget.clock_format = crate::clock_format::ClockFormat::TwentyFourHour;
+    widget.windows_sandbox_host = crate::app::WindowsSandboxHost::Local;
+    widget.windows_sandbox_config.requirements = Some(None);
     widget.transcript.active_cell = None;
     widget.transcript.active_cell_revision = 0;
     widget.set_model(&resolved_model);
@@ -332,8 +377,8 @@ pub(crate) async fn make_chatwidget_manual_with_sender() -> (
     tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
     tokio::sync::mpsc::UnboundedReceiver<Op>,
 ) {
-    let (widget, rx, op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    let app_event_tx = widget.app_event_tx.clone();
+    let (widget, rx, op_rx) = boxed_future!(make_chatwidget_manual(/*model_override*/ None)).await;
+    let app_event_tx = AppEventSender::new(widget.app_event_tx.app_event_tx.clone());
     (widget, app_event_tx, rx, op_rx)
 }
 
@@ -343,13 +388,56 @@ pub(super) fn drain_insert_history(
     drain_insert_history_with(rx, |cell| cell.display_lines(/*width*/ 80))
 }
 
+pub(super) fn drain_insert_history_normalized(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+) -> Vec<Vec<ratatui::text::Line<'static>>> {
+    drain_insert_history_with(rx, |cell| {
+        cell.display_lines(/*width*/ 80)
+            .into_iter()
+            .map(|mut line| {
+                if cell.as_any().is::<history_cell::FinalMessageSeparator>() {
+                    line.spans = vec![normalize_completion_timestamps(cell, &line).into()];
+                }
+                line
+            })
+            .collect()
+    })
+}
+
 pub(super) fn drain_insert_history_transcript(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
 ) -> Vec<Vec<ratatui::text::Line<'static>>> {
-    drain_insert_history_with(rx, |cell| cell.transcript_lines(/*width*/ 80))
+    drain_insert_history_with(rx, |cell| {
+        cell.transcript_lines(/*width*/ 80)
+            .into_iter()
+            .map(|mut line| {
+                if cell.as_any().is::<history_cell::FinalMessageSeparator>() {
+                    line.spans = vec![normalize_completion_timestamps(cell, &line).into()];
+                }
+                line
+            })
+            .collect()
+    })
 }
 
-fn drain_insert_history_with(
+// Preserve ordering checks for history cells intentionally hidden from compact chat.
+pub(super) fn drain_insert_history_transcript_normalized(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+) -> Vec<Vec<ratatui::text::Line<'static>>> {
+    drain_insert_history_with(rx, |cell| {
+        cell.transcript_lines(/*width*/ 80)
+            .into_iter()
+            .map(|mut line| {
+                if cell.as_any().is::<history_cell::FinalMessageSeparator>() {
+                    line.spans = vec![normalize_completion_timestamps(cell, &line).into()];
+                }
+                line
+            })
+            .collect()
+    })
+}
+
+pub(super) fn drain_insert_history_with(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
     render: impl Fn(&dyn HistoryCell) -> Vec<ratatui::text::Line<'static>>,
 ) -> Vec<Vec<ratatui::text::Line<'static>>> {
@@ -769,10 +857,13 @@ pub(super) fn handle_image_generation_end(
                 id: call_id.into(),
                 status: status.into(),
                 revised_prompt,
-                result: String::new(),
+                image: GeneratedImageRef::Inline {
+                    result: String::new(),
+                },
                 transparent_background: None,
                 failure: None,
                 saved_path,
+                input_images: Vec::new(),
                 imagegen_request_id: None,
                 generation_id: None,
             }),
@@ -884,6 +975,7 @@ pub(super) fn begin_exec_with_source(
         .collect();
     let item = AppServerThreadItem::CommandExecution {
         model_context: None,
+        sandbox_type: None,
         id: call_id.to_string(),
         command: codex_shell_command::parse_command::shlex_join(&command),
         cwd: chat.config.cwd.clone().into(),
@@ -910,6 +1002,7 @@ pub(super) fn begin_unified_exec_startup(
     let command = vec!["bash".to_string(), "-lc".to_string(), raw_cmd.to_string()];
     let item = AppServerThreadItem::CommandExecution {
         model_context: None,
+        sandbox_type: None,
         id: call_id.to_string(),
         command: codex_shell_command::parse_command::shlex_join(&command),
         cwd: chat.config.cwd.clone().into(),
@@ -1043,6 +1136,7 @@ pub(super) fn app_server_turn(
 ) -> AppServerTurn {
     AppServerTurn {
         id: turn_id.to_string(),
+        root_turn_id: None,
         items_view: codex_app_server_protocol::TurnItemsView::Full,
         items: Vec::new(),
         status,
@@ -1145,6 +1239,7 @@ pub(super) fn end_exec(
         chat,
         AppServerThreadItem::CommandExecution {
             model_context: None,
+            sandbox_type: None,
             id,
             command,
             cwd,
@@ -1224,43 +1319,6 @@ pub(super) fn get_available_model(chat: &ChatWidget, model: &str) -> ModelPreset
         .unwrap_or_else(|| panic!("{model} preset not found"))
 }
 
-pub(super) async fn assert_shift_left_edits_most_recent_queued_message_for_terminal(
-    terminal_info: TerminalInfo,
-) {
-    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.queued_message_edit_hint_binding =
-        Some(queued_message_edit_binding_for_terminal(terminal_info).into());
-    chat.bottom_pane
-        .set_queued_message_edit_binding(chat.queued_message_edit_hint_binding);
-
-    // Simulate a running task so messages would normally be queued.
-    chat.bottom_pane.set_task_running(/*running*/ true);
-
-    // Seed two queued messages.
-    chat.input_queue
-        .queued_user_messages
-        .push_back(UserMessage::from("first queued".to_string()).into());
-    chat.input_queue
-        .queued_user_messages
-        .push_back(UserMessage::from("second queued".to_string()).into());
-    chat.refresh_pending_input_preview();
-
-    // Press Shift+Left to edit the most recent (last) queued message.
-    chat.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
-
-    // Composer should now contain the last queued message.
-    assert_eq!(
-        chat.bottom_pane.composer_text(),
-        "second queued".to_string()
-    );
-    // And the queue should now contain only the remaining (older) item.
-    assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
-    assert_eq!(
-        chat.input_queue.queued_user_messages.front().unwrap().text,
-        "first queued"
-    );
-}
-
 pub(super) fn render_bottom_first_row(chat: &ChatWidget, width: u16) -> String {
     let height = chat.desired_height(width);
     let area = Rect::new(0, 0, width, height);
@@ -1297,7 +1355,7 @@ pub(crate) fn render_bottom_popup(chat: &ChatWidget, width: u16) -> String {
                 if symbol.is_empty() {
                     line.push(' ');
                 } else {
-                    line.push_str(symbol);
+                    line.push_str(&crate::terminal_hyperlinks::strip_osc8(symbol));
                 }
             }
             line.trim_end().to_string()
@@ -1542,6 +1600,7 @@ pub(super) fn plugins_test_detail(
     mcp_servers: &[&str],
 ) -> PluginDetail {
     PluginDetail {
+        onboarding_skill: None,
         marketplace_name: "ChatGPT Marketplace".to_string(),
         marketplace_path: Some(plugins_test_absolute_path("marketplaces/chatgpt")),
         summary,
@@ -1554,9 +1613,7 @@ pub(super) fn plugins_test_detail(
                 description: format!("{name} description"),
                 short_description: None,
                 interface: None,
-                path: Some(plugins_test_absolute_path(&format!(
-                    "skills/{name}/SKILL.md"
-                ))),
+                path: Some(plugins_test_absolute_path(&format!("skills/{name}/SKILL.md")).into()),
                 enabled: true,
             })
             .collect(),
@@ -1594,6 +1651,7 @@ pub(super) fn plugins_test_remote_detail(
     description: Option<&str>,
 ) -> PluginDetail {
     PluginDetail {
+        onboarding_skill: None,
         marketplace_name: marketplace_name.to_string(),
         marketplace_path: None,
         summary,
@@ -1698,11 +1756,10 @@ pub(super) fn hook_run(
     }
 }
 
-pub(super) async fn assert_hook_events_snapshot(
+pub(super) async fn assert_hook_events(
     event_name: codex_app_server_protocol::HookEventName,
     run_id: &str,
     status_message: &str,
-    snapshot_name: &str,
 ) {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.on_task_started();
@@ -1763,14 +1820,20 @@ pub(super) async fn assert_hook_events_snapshot(
         .iter()
         .map(|lines| lines_to_single_string(lines))
         .collect::<String>();
-    assert_chatwidget_snapshot!(snapshot_name, combined);
+    assert_eq!(combined, "↳ Hook · Heads up from the hook\n");
 }
 
-/// Normalize complete footer lines only, in snapshots that opt into clock normalization.
-pub(crate) fn normalize_completion_timestamps(value: impl std::fmt::Display) -> String {
+/// Normalize timestamps only in structurally identified completion footer cells.
+pub(crate) fn normalize_completion_timestamps(
+    cell: &dyn HistoryCell,
+    value: impl std::fmt::Display,
+) -> String {
+    if !cell.as_any().is::<history_cell::FinalMessageSeparator>() {
+        return value.to_string();
+    }
     static COMPLETION_FOOTER: std::sync::LazyLock<regex_lite::Regex> = std::sync::LazyLock::new(
         || {
-            regex_lite::Regex::new(r"(?m)^(?P<indent>[ \t]*)(?P<duration>Worked for (?:[0-9]+h )?(?:[0-9]+m )?[0-9]+s · )?done (?:[A-Z][a-z]{2} [0-9]{1,2}(?:, [0-9]{4})? at )?[0-9]{1,2}:[0-9]{2} (?:AM|PM)(?P<padding>[ \t]*)$")
+            regex_lite::Regex::new(r"(?m)^(?P<indent>[ \t]*)(?P<duration>Worked for (?:<1s|(?:[0-9]+h )?(?:[0-9]+m )?[0-9]+s) • )?(?:[A-Z][a-z]{2} [0-9]{1,2}(?:, [0-9]{4})? at )?[0-9]{1,2}:[0-9]{2}(?: (?:AM|PM))?(?P<padding>[ \t]*)$")
                 .expect("valid completion footer pattern")
         },
     );
@@ -1779,11 +1842,11 @@ pub(crate) fn normalize_completion_timestamps(value: impl std::fmt::Display) -> 
             let indent = &captures["indent"];
             let padding = &captures["padding"];
             let duration = if captures.name("duration").is_some() {
-                "Worked for [duration] · "
+                "Worked for [duration] • "
             } else {
                 ""
             };
-            format!("{indent}{duration}done [completion time]{padding}")
+            format!("{indent}{duration}[completion time]{padding}")
         })
         .into_owned()
 }

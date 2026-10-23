@@ -5,6 +5,7 @@ use anyhow::Result;
 use codex_config::test_support::CloudConfigBundleFixture;
 use codex_config::types::AppToolApproval;
 use codex_core::TurnInputRequest;
+use codex_core::TurnStartOptions;
 use codex_core::config::Config;
 use codex_features::Feature;
 use codex_history::RolloutItem;
@@ -14,6 +15,8 @@ use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
+use codex_protocol::items::McpAppDisplayMode;
+use codex_protocol::items::McpAppUi;
 use codex_protocol::items::McpToolCallStatus;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::NetworkPermissions;
@@ -23,9 +26,11 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::ElicitationAction;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ItemCompletedEvent;
+use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ThreadSettingsOverrides;
-use codex_protocol::protocol::TurnEnvironmentSelections;
+use codex_protocol::protocol::TurnEnvironmentRequests;
 use codex_protocol::protocol::TurnSettingsUpdate;
 use codex_protocol::protocol::TurnSettingsUpdateOutcome;
 use codex_protocol::request_permissions::PermissionGrantScope;
@@ -70,6 +75,150 @@ use wiremock::ResponseTemplate;
 use wiremock::matchers::body_partial_json;
 use wiremock::matchers::method;
 use wiremock::matchers::path_regex;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[test_case(json!({"ui": {"resourceUri": "ui://calendar/widget"}, "openai/ui": {"preferredModelDisplayMode": "fullscreen"}}), Some(McpAppDisplayMode::Fullscreen), Some("ui://calendar/widget"); "fullscreen")]
+#[test_case(json!({"ui": {"resourceUri": "ui://calendar/widget"}, "openai/ui": {"preferredModelDisplayMode": "inline"}}), Some(McpAppDisplayMode::Inline), Some("ui://calendar/widget"); "inline")]
+#[test_case(json!({"ui": {"resourceUri": "ui://calendar/widget"}}), None, Some("ui://calendar/widget"); "missing preference")]
+#[test_case(json!({"ui": {"resourceUri": "ui://calendar/widget"}, "openai/ui": {"preferredModelDisplayMode": "unsupported"}}), None, Some("ui://calendar/widget"); "unsupported preference")]
+#[test_case(json!({"openai/outputTemplate": "ui://calendar/widget"}), None, Some("ui://calendar/widget"); "legacy uri")]
+#[test_case(json!({}), None, None; "result only ui")]
+async fn mcp_app_ui_survives_tool_events_and_resume(
+    mut metadata: Value,
+    expected_mode: Option<McpAppDisplayMode>,
+    expected_uri: Option<&str>,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let apps_server = AppsTestServer::mount(&server).await?;
+    metadata["connector_id"] = json!("calendar");
+    metadata["connector_name"] = json!("Calendar");
+    Mock::given(method("POST"))
+        .and(path_regex("^/api/codex/ps/mcp/?$"))
+        .and(body_partial_json(json!({"method": "tools/list"})))
+        .respond_with(move |request: &Request| {
+            let body: Value = serde_json::from_slice(&request.body).expect("valid tools/list");
+            ResponseTemplate::new(/*status*/ 200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": {"tools": [{
+                    "name": "calendar_create_event",
+                    "description": "Create a calendar event.",
+                    "inputSchema": {"type": "object", "properties": {}},
+                    "annotations": {"readOnlyHint": true},
+                    "_meta": metadata
+                }]}
+            }))
+        })
+        .with_priority(/*priority*/ 1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex("^/api/codex/ps/mcp/?$"))
+        .and(body_partial_json(json!({"method": "tools/call"})))
+        .respond_with(|request: &Request| {
+            let body: Value = serde_json::from_slice(&request.body).expect("valid tools/call");
+            ResponseTemplate::new(/*status*/ 200).set_body_json(json!({
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": {
+                    "content": [{"type": "text", "text": "Calendar opened."}],
+                    "_meta": {"openai/outputTemplate": "ui://calendar/result-widget"},
+                    "isError": false
+                }
+            }))
+        })
+        .with_priority(/*priority*/ 1)
+        .mount(&server)
+        .await;
+    let call_id = "calendar-ui";
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-calendar"),
+                ev_function_call_with_namespace(
+                    call_id,
+                    SEARCH_CALENDAR_NAMESPACE,
+                    SEARCH_CALENDAR_CREATE_TOOL,
+                    "{}",
+                ),
+                ev_completed("resp-calendar"),
+            ]),
+            sse(vec![
+                ev_assistant_message("msg-done", "done"),
+                ev_completed("resp-done"),
+            ]),
+        ],
+    )
+    .await;
+    let mut builder = search_capable_apps_builder(apps_server.chatgpt_base_url);
+    let test = builder.build_with_auto_env(&server).await?;
+    submit_user_turn(
+        &test,
+        "Use [$calendar](app://calendar) to open the calendar widget.",
+        AskForApproval::Never,
+        PermissionProfile::Disabled,
+        /*collaboration_mode*/ None,
+    )
+    .await?;
+
+    let expected_ui = expected_mode.map(|preferred_model_display_mode| McpAppUi {
+        resource_uri: "ui://calendar/widget".to_string(),
+        preferred_model_display_mode,
+    });
+    let expected_uri = expected_uri.map(str::to_string);
+    let mut observed = Vec::new();
+    let mut completed = None;
+    wait_for_event(&test.codex, |event| {
+        match event {
+            EventMsg::ItemStarted(ItemStartedEvent {
+                item: TurnItem::McpToolCall(item),
+                ..
+            })
+            | EventMsg::ItemCompleted(ItemCompletedEvent {
+                item: TurnItem::McpToolCall(item),
+                ..
+            }) => {
+                observed.push((item.mcp_app_ui.clone(), item.mcp_app_resource_uri.clone()));
+            }
+            EventMsg::McpToolCallBegin(begin) => {
+                observed.push((begin.mcp_app_ui.clone(), begin.mcp_app_resource_uri.clone()));
+            }
+            EventMsg::McpToolCallEnd(end) => {
+                assert!(end.result.is_ok());
+                observed.push((end.mcp_app_ui.clone(), end.mcp_app_resource_uri.clone()));
+                completed = Some(event.clone());
+            }
+            _ => {}
+        }
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    assert_eq!(observed, vec![(expected_ui, expected_uri); 4]);
+    assert_eq!(responses.requests().len(), 2);
+
+    let resumed = builder.restart(&server, &test).await?;
+    let completed_history = resumed
+        .codex
+        .load_history(/*include_archived*/ false)
+        .await?
+        .items
+        .into_iter()
+        .filter_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::McpToolCallEnd(end)) if end.call_id == call_id => {
+                Some(EventMsg::McpToolCallEnd(end))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        serde_json::to_value(completed_history)?,
+        serde_json::to_value(vec![completed.expect("completed MCP call")])?
+    );
+    Ok(())
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_session_approval_is_scoped_to_tool_link_id() -> Result<()> {
@@ -229,6 +378,7 @@ async fn auto_session_approval_is_scoped_to_tool_link_id() -> Result<()> {
         let mut expected_result = json!({
             "_codex_apps": {
                 "call_id": call_id,
+                "root_turn_id": request.body_json()["client_metadata"]["turn_id"],
                 "connector_id": "calendar",
                 "contains_mcp_source": true,
                 "resource_uri": "connector://calendar/tools/calendar_create_event"
@@ -306,9 +456,9 @@ async fn submit_user_turn(
                 text_elements: Vec::new(),
             }])
             .with_thread_settings(ThreadSettingsOverrides {
-                environments: Some(TurnEnvironmentSelections::new(
+                environments: Some(TurnEnvironmentRequests::new(
                     test.config.cwd.clone(),
-                    vec![test.executor_environment().selection().clone()],
+                    vec![test.executor_environment().request()],
                 )),
                 approval_policy: Some(approval_policy),
                 sandbox_policy: Some(sandbox_policy),
@@ -335,8 +485,8 @@ fn attribution_models(model_slugs: [&str; 2]) -> Vec<codex_protocol::openai_mode
         .expect("bundled models should parse")
         .models
         .into_iter()
-        .find(|model| model.slug == "gpt-5.4")
-        .expect("bundled gpt-5.4 model");
+        .find(|model| model.slug == "gpt-5.5")
+        .expect("bundled gpt-5.5 model");
     model_slugs
         .into_iter()
         .map(|slug| {
@@ -506,15 +656,39 @@ async fn approved_mcp_tool_call_metadata_records_prior_user_input_request(
             );
         });
     let test = builder.build(&server).await?;
-
-    submit_user_turn(
-        &test,
-        "Use [$calendar](app://calendar) to create a calendar event.",
-        AskForApproval::OnRequest,
-        PermissionProfile::Disabled,
-        /*collaboration_mode*/ None,
-    )
-    .await?;
+    let root_turn_id = "originating-calendar-turn";
+    let (sandbox_policy, permission_profile) =
+        turn_permission_fields(PermissionProfile::Disabled, test.cwd.path());
+    test.codex
+        .start_or_steer_turn(
+            TurnInputRequest::user_input(vec![UserInput::Text {
+                text: "Use [$calendar](app://calendar) to create a calendar event.".to_string(),
+                text_elements: Vec::new(),
+            }])
+            .on_start(TurnStartOptions {
+                root_turn_id: Some(root_turn_id.to_string()),
+                ..Default::default()
+            })
+            .with_thread_settings(ThreadSettingsOverrides {
+                environments: Some(TurnEnvironmentRequests::new(
+                    test.config.cwd.clone(),
+                    vec![test.executor_environment().request()],
+                )),
+                approval_policy: Some(AskForApproval::OnRequest),
+                sandbox_policy: Some(sandbox_policy),
+                permission_profile,
+                collaboration_mode: Some(CollaborationMode {
+                    mode: ModeKind::Default,
+                    settings: Settings {
+                        model: test.session_configured.model.clone(),
+                        reasoning_effort: None,
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            }),
+        )
+        .await?;
 
     if strict_auto_review {
         let event = wait_for_event(&test.codex, |event| {
@@ -583,10 +757,7 @@ async fn approved_mcp_tool_call_metadata_records_prior_user_input_request(
         2 + 2 * usize::from(strict_auto_review)
     );
     let response_body = response_requests[0].body_json();
-    let turn_id = response_body["client_metadata"]["turn_id"]
-        .as_str()
-        .expect("Responses request turn id");
-    assert_root_turn(&response_body, Some(turn_id))?;
+    assert_root_turn(&response_body, Some(root_turn_id))?;
     let apps_tool_call = recorded_apps_tool_call_by_call_id(&server, call_id).await;
     let mcp_turn_metadata = apps_tool_call
         .pointer("/params/_meta/x-codex-turn-metadata")
@@ -601,6 +772,11 @@ async fn approved_mcp_tool_call_metadata_records_prior_user_input_request(
             mcp_turn_metadata.get("parent_turn_id"),
         ),
         (None, None)
+    );
+
+    assert_eq!(
+        apps_tool_call.pointer("/params/_meta/_codex_apps/root_turn_id"),
+        Some(&json!(root_turn_id))
     );
 
     assert_eq!(
@@ -786,12 +962,7 @@ approvals_reviewer = "auto_review"
     let guardian_request = responses
         .requests()
         .into_iter()
-        .find(|request| {
-            request
-                .message_input_texts("developer")
-                .iter()
-                .any(|text| text.starts_with("You are judging one planned coding-agent action."))
-        })
+        .find(|request| request.body_json()["client_metadata"]["x-openai-subagent"] == "guardian")
         .expect("expected a Guardian request for the app MCP approval");
     assert!(guardian_request.body_contains_text("calendar_create_event"));
     assert!(guardian_request.body_contains_text("Lunch"));
@@ -1352,6 +1523,28 @@ async fn apps_default_writes_prompts_for_writes_but_not_reads() -> Result<()> {
     assert_eq!(responses.requests().len(), 3);
     recorded_apps_tool_call_by_call_id(&server, read_call_id).await;
     recorded_apps_tool_call_by_call_id(&server, write_call_id).await;
+
+    let first_turn_id = responses.requests()[2].body_json()["client_metadata"]["turn_id"].clone();
+    assert!(first_turn_id.is_string());
+    assert_eq!(
+        serde_json::to_value(codex_core::test_support::mcp_attribution_snapshot(
+            &test.codex
+        ))?,
+        json!({
+            "status": "complete",
+            "sources": [{
+                "connector_id": "calendar",
+                "server_name": "codex_apps",
+                "tool_name": "calendar_list_events",
+                "first_turn_id": first_turn_id,
+            }, {
+                "connector_id": "calendar",
+                "server_name": "codex_apps",
+                "tool_name": "calendar_create_event",
+                "first_turn_id": first_turn_id,
+            }],
+        })
+    );
 
     test.codex.ensure_rollout_materialized().await;
     test.codex.flush_rollout().await?;

@@ -15,7 +15,9 @@ use crate::protocol::item_builders::convert_patch_changes;
 use crate::protocol::item_builders::review_output_text;
 use codex_experimental_api_macros::ExperimentalApi;
 use codex_extension_items::ExtensionItem;
+pub use codex_extension_items::image_generation::GeneratedImageRef;
 pub use codex_extension_items::image_generation::ImageGenerationFailure;
+pub use codex_extension_items::image_generation::ImageGenerationInputImage;
 pub use codex_extension_items::image_generation::ImageGenerationItem;
 pub use codex_extension_items::sleep::SleepItem;
 pub use codex_extension_items::web_search::WebSearchAction;
@@ -31,6 +33,8 @@ use codex_protocol::items::CollabAgentTool as CoreCollabAgentTool;
 use codex_protocol::items::CollabAgentToolCallStatus as CoreCollabAgentToolCallStatus;
 use codex_protocol::items::CommandExecutionStatus as CoreCommandExecutionStatus;
 use codex_protocol::items::DynamicToolCallStatus as CoreDynamicToolCallStatus;
+pub use codex_protocol::items::McpAppDisplayMode;
+pub use codex_protocol::items::McpAppUi;
 use codex_protocol::items::McpToolCallStatus as CoreMcpToolCallStatus;
 use codex_protocol::items::TurnItem as CoreTurnItem;
 use codex_protocol::memory_citation::MemoryCitation as CoreMemoryCitation;
@@ -290,6 +294,10 @@ pub enum ThreadItem {
         #[serde(skip)]
         #[schemars(skip)]
         #[ts(skip)]
+        sandbox_type: Option<codex_protocol::sandbox::SandboxType>,
+        #[serde(skip)]
+        #[schemars(skip)]
+        #[ts(skip)]
         model_context: Option<codex_protocol::items::ModelInvocationContext>,
         id: String,
         /// Trusted first-party plugin id when this command resolves to one plugin script.
@@ -337,8 +345,10 @@ pub enum ThreadItem {
         app_context: Option<McpToolCallAppContext>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[ts(optional)]
-        /// Deprecated: use `appContext.resourceUri` instead.
+        /// Legacy compatibility field; prefer `mcpAppUi.resourceUri` when available.
         mcp_app_resource_uri: Option<String>,
+        /// Presentation captured from the invoked descriptor; absent in older history.
+        mcp_app_ui: Option<McpAppUi>,
         plugin_id: Option<String>,
         read_only_hint: Option<bool>,
         result: Option<Box<McpToolCallResult>>,
@@ -387,6 +397,10 @@ pub enum ThreadItem {
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
     SubAgentActivity {
+        /// Resolved model at sub-agent creation; absent from older records and other activities.
+        model: Option<String>,
+        /// Resolved reasoning effort at sub-agent creation, when known.
+        reasoning_effort: Option<ReasoningEffort>,
         id: String,
         kind: SubAgentActivityKind,
         agent_thread_id: String,
@@ -915,6 +929,7 @@ impl From<CoreTurnItem> for ThreadItem {
                 ThreadItem::CommandExecution {
                     id: command.id,
                     model_context: command.model_context,
+                    sandbox_type: command.sandbox_type,
                     plugin_id: command.plugin_id,
                     script_path: command.script_path,
                     command: presentation.command,
@@ -969,6 +984,8 @@ impl From<CoreTurnItem> for ThreadItem {
                     .collect(),
             },
             CoreTurnItem::SubAgentActivity(activity) => ThreadItem::SubAgentActivity {
+                model: activity.model,
+                reasoning_effort: activity.reasoning_effort,
                 id: activity.id,
                 kind: activity.kind.into(),
                 agent_thread_id: activity.agent_thread_id.to_string(),
@@ -994,10 +1011,13 @@ impl From<CoreTurnItem> for ThreadItem {
                     id: image.id,
                     status: image.status,
                     revised_prompt: image.revised_prompt,
-                    result: image.result,
+                    image: GeneratedImageRef::Inline {
+                        result: image.result,
+                    },
                     transparent_background: None,
                     failure: None,
                     saved_path: image.saved_path,
+                    input_images: Vec::new(),
                     imagegen_request_id: None,
                     generation_id: None,
                 })
@@ -1038,6 +1058,7 @@ impl From<CoreTurnItem> for ThreadItem {
                         action_name: mcp.action_name,
                     }),
                     mcp_app_resource_uri: mcp.mcp_app_resource_uri,
+                    mcp_app_ui: mcp.mcp_app_ui,
                     plugin_id: mcp.plugin_id,
                     read_only_hint: mcp.read_only_hint,
                     result: mcp.result.map(McpToolCallResult::from).map(Box::new),

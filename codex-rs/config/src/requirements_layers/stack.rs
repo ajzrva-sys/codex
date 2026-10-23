@@ -152,6 +152,12 @@ impl RequirementsLayerStack {
 
         let mut merged_toml = TomlValue::Table(toml::map::Map::new());
         for layer in &layers {
+            // An endpoint and its credentials must come from the same requirements layer.
+            if layer.regular_toml.get("config_server").is_some()
+                && let Some(table) = merged_toml.as_table_mut()
+            {
+                table.remove("config_server");
+            }
             merge_toml_values(&mut merged_toml, &layer.regular_toml);
         }
 
@@ -211,6 +217,7 @@ fn populate_merged_regular_fields_with_sources(
     // Destructure without `..` so every new requirements field must choose
     // whether it belongs in the regular TOML merge path or in a special merger.
     let ConfigRequirementsToml {
+        config_server,
         allowed_login_methods,
         allowed_chatgpt_workspaces,
         cli_auth_credentials_store,
@@ -253,8 +260,10 @@ fn populate_merged_regular_fields_with_sources(
         models,
         additional_developer_instructions,
         guardian_policy_config,
+        guardian_extra_policy,
     } = requirements;
 
+    set_sourced!(config_server, &["config_server"]);
     set_sourced!(allowed_login_methods, &["allowed_login_methods"]);
     set_sourced!(allowed_chatgpt_workspaces, &["allowed_chatgpt_workspaces"]);
     set_sourced!(cli_auth_credentials_store, &["cli_auth_credentials_store"]);
@@ -317,6 +326,14 @@ fn populate_merged_regular_fields_with_sources(
             source_for_top_level_keys(layers, &["guardian_policy_config"]),
         ));
     }
+    if let Some(guardian_extra_policy) =
+        guardian_extra_policy.filter(|value| !value.trim().is_empty())
+    {
+        output.guardian_extra_policy = Some(Sourced::new(
+            guardian_extra_policy,
+            source_for_top_level_keys(layers, &["guardian_extra_policy"]),
+        ));
+    }
 }
 
 fn source_for_top_level_keys(
@@ -334,7 +351,8 @@ fn source_for_top_level_keys(
     };
     let winning_source = (*winning_source).clone();
 
-    if !winning_value.is_table() {
+    // The config_server block is replaced as a whole, including its source attribution.
+    if keys == ["config_server"] || !winning_value.is_table() {
         return winning_source;
     }
 

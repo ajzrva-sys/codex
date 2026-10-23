@@ -295,7 +295,7 @@ async fn modern_tool_mrtr_drives_form_and_url_elicitation_and_preserves_metadata
             .call_tool(
                 "confirm".into(),
                 Some(json!({"mode": mode})),
-                Some(json!({"requestContext": "caller-context"})),
+                |_| Ok(Some(json!({"requestContext": "caller-context"}))),
                 Some(Duration::from_secs(5)),
             )
             .await?;
@@ -378,6 +378,10 @@ async fn modern_tool_mrtr_uses_recovered_protocol_after_legacy_session_expiry() 
                         body.pointer("/params/_meta/requestContext"),
                         Some(&json!("caller-context"))
                     );
+                    assert_eq!(
+                        body.pointer("/params/_meta/openai~1readOnly"),
+                        Some(&json!(true))
+                    );
                     let attempt = {
                         let mut calls = recorded_calls.lock().expect("requests lock");
                         calls.push(body.clone());
@@ -449,12 +453,18 @@ async fn modern_tool_mrtr_uses_recovered_protocol_after_legacy_session_expiry() 
         .await;
 
     let elicitation_modes = Arc::new(Mutex::new(Vec::new()));
-    let client = create_client(&server, Arc::clone(&elicitation_modes)).await?;
+    let client = create_client(&server, Arc::clone(&elicitation_modes))
+        .await?
+        .with_read_only_tools(/*requires_read_only_tools*/ true);
     let result = client
         .call_tool(
             "confirm".into(),
             Some(json!({})),
-            Some(json!({"requestContext": "caller-context"})),
+            |_| {
+                Ok(Some(
+                    json!({"requestContext": "caller-context", "openai/readOnly": false}),
+                ))
+            },
             Some(Duration::from_secs(5)),
         )
         .await?;
@@ -633,7 +643,7 @@ async fn modern_tool_mrtr_accepts_sse_discovery_and_metadata_bearing_rounds() ->
         .call_tool(
             "confirm".to_owned(),
             Some(json!({})),
-            /*meta*/ None,
+            |_| Ok(None),
             Some(Duration::from_secs(5)),
         )
         .await?;
@@ -709,7 +719,7 @@ async fn modern_tool_mrtr_preserves_state_only_rounds_without_elicitation() -> a
         .call_tool(
             "state-only".into(),
             Some(json!({})),
-            /*meta*/ None,
+            |_| Ok(None),
             Some(Duration::from_secs(5)),
         )
         .await?;

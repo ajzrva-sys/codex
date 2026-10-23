@@ -22,6 +22,7 @@ def main() -> None:
     parser.add_argument("--codex-bin", type=Path)
     parser.add_argument("--code-mode-host-bin", type=Path)
     parser.add_argument("--sandbox-daemon-bin", type=Path)
+    parser.add_argument("--sandbox-client-bin", type=Path)
     parser.add_argument(
         "--cli-only",
         action="store_true",
@@ -46,8 +47,9 @@ def main() -> None:
     codex = args.codex_bin
     host = args.code_mode_host_bin
     daemon = args.sandbox_daemon_bin
+    client = args.sandbox_client_bin
     build_host = host is None and not args.cli_only
-    if codex is None or build_host or daemon is None:
+    if codex is None or build_host or daemon is None or client is None:
         commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True
         ).strip()
@@ -58,6 +60,15 @@ def main() -> None:
         if daemon is None:
             command.extend(
                 ["-p", "codex-freebsd-sandbox", "--bin", "codex-freebsd-sandboxd"]
+            )
+        if client is None:
+            command.extend(
+                [
+                    "-p",
+                    "codex-freebsd-sandbox-client",
+                    "--bin",
+                    "codex-freebsd-sandbox-client",
+                ]
             )
         if build_host:
             env.update(build_v8(REPO_ROOT, args.v8_build_dir))
@@ -81,6 +92,8 @@ def main() -> None:
             host = target_dir / profile_dir / "codex-code-mode-host"
         if daemon is None:
             daemon = target_dir / profile_dir / "codex-freebsd-sandboxd"
+        if client is None:
+            client = target_dir / profile_dir / "codex-freebsd-sandbox-client"
     codex = codex.resolve(strict=True)
     subprocess.run([str(codex), "--version"], check=True)
     rg = shutil.which("rg")
@@ -100,6 +113,7 @@ def main() -> None:
         # This copy is an installation artifact, never launched by the npm wrapper.
         # The administrator installs a separate root-owned executable explicitly.
         shutil.copy2(daemon, native / "bin/codex-freebsd-sandboxd")
+        shutil.copy2(client, native / "bin/codex-freebsd-sandbox-client")
         admin = package / "freebsd"
         admin.mkdir()
         for script in [

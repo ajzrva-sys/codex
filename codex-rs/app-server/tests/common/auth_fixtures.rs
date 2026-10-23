@@ -17,7 +17,9 @@ use serde_json::json;
 
 pub async fn mount_workspace_routing(server: &wiremock::MockServer) {
     wiremock::Mock::given(wiremock::matchers::method("GET"))
-        .and(wiremock::matchers::path("/backend-api/wham/accounts/check"))
+        .and(wiremock::matchers::path_regex(
+            "^/(backend-api/wham|api/codex)/accounts/check$",
+        ))
         .respond_with(|request: &wiremock::Request| {
             let account_id = request
                 .headers
@@ -38,6 +40,7 @@ pub async fn mount_workspace_routing(server: &wiremock::MockServer) {
 pub struct ChatGptAuthFixture {
     access_token: String,
     refresh_token: String,
+    login_owner_id: Option<String>,
     account_id: Option<String>,
     claims: ChatGptIdTokenClaims,
     last_refresh: Option<Option<DateTime<Utc>>>,
@@ -48,6 +51,7 @@ impl ChatGptAuthFixture {
         Self {
             access_token: access_token.into(),
             refresh_token: "refresh-token".to_string(),
+            login_owner_id: None,
             account_id: None,
             claims: ChatGptIdTokenClaims::default(),
             last_refresh: None,
@@ -56,6 +60,11 @@ impl ChatGptAuthFixture {
 
     pub fn refresh_token(mut self, refresh_token: impl Into<String>) -> Self {
         self.refresh_token = refresh_token.into();
+        self
+    }
+
+    pub fn login_owner_id(mut self, login_owner_id: impl Into<String>) -> Self {
+        self.login_owner_id = Some(login_owner_id.into());
         self
     }
 
@@ -176,6 +185,8 @@ pub fn write_chatgpt_auth(
         id_token,
         access_token: fixture.access_token,
         refresh_token: fixture.refresh_token,
+        oauth_provenance: None,
+        login_owner_id: fixture.login_owner_id,
         account_id: fixture.account_id,
     };
 

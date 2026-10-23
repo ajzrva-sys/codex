@@ -7,12 +7,14 @@ mod recording_controls_tests;
 mod session_metrics_tests;
 
 use super::RealtimeConversationPhase;
+use super::RealtimeFailureCause;
 use crate::app_command::AppCommand;
 use crate::app_event::AppEvent;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::ReplayKind;
 use crate::chatwidget::tests::make_chatwidget_manual_with_sender;
 use crate::chatwidget::tests::render_bottom_popup;
+use crate::history_cell::FinalMessageSeparator;
 use codex_app_server_protocol::AgentMessageDeltaNotification;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
@@ -125,6 +127,7 @@ fn finish_turn(
             thread_id: thread_id.to_string(),
             turn: Turn {
                 id: turn_id.to_string(),
+                root_turn_id: None,
                 items,
                 items_view: TurnItemsView::Summary,
                 status,
@@ -136,19 +139,6 @@ fn finish_turn(
         }),
         /*replay_kind*/ None,
     );
-}
-
-fn without_completion_metadata(rendered: &str) -> String {
-    rendered
-        .lines()
-        .filter_map(|line| {
-            let stable = line
-                .split_once("  done ")
-                .map_or(line, |(before, _)| before);
-            (!stable.is_empty()).then_some(stable)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 #[path = "realtime_tests/caption_replay.rs"]

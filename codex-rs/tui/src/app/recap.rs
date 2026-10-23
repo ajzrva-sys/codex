@@ -17,6 +17,7 @@ use crate::temporary_structured_request::TemporaryStructuredThreadOptions;
 use crate::temporary_structured_request::run_temporary_structured_turn;
 use crate::temporary_structured_request::start_temporary_thread;
 use crate::temporary_structured_request::unsubscribe_temporary_thread;
+use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::Turn;
 use codex_app_server_protocol::TurnStatus;
 use codex_context_fragments::ContextualUserFragment;
@@ -54,7 +55,10 @@ struct GeneratedRecap {
 }
 
 fn recap_prompt(history: &str) -> String {
-    RecapPrompt::new(history).render()
+    RecapPrompt::new(history)
+        .render()
+        .into_text()
+        .unwrap_or_default()
 }
 
 fn recap_output_schema() -> Value {
@@ -152,6 +156,7 @@ impl App {
         };
 
         self.transcript_cells.remove(index);
+        self.native_history.retain(&self.transcript_cells);
         if let Some(Overlay::Transcript(overlay)) = &mut self.overlay {
             overlay.replace_cells(self.transcript_cells.clone());
         }
@@ -222,6 +227,7 @@ impl App {
             config.cwd.display().to_string()
         };
         let options = TemporaryStructuredThreadOptions {
+            thread_source: ThreadSource::Feature("system".to_string()),
             model,
             model_provider: config.model_provider_id.clone(),
             cwd,

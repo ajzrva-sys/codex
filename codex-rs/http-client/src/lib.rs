@@ -1,12 +1,21 @@
+use url::Host;
+use url::Url;
+
 mod chatgpt_cloudflare_cookies;
 mod chatgpt_hosts;
 mod client;
 mod client_builder;
+mod client_tls;
 mod custom_ca;
 mod error;
+mod native_roots;
 mod network_policy;
 mod outbound_proxy;
 mod request;
+mod request_builder;
+mod request_draft;
+mod response;
+mod retry_after;
 mod route_aware_client_pool;
 mod route_aware_redirect;
 mod tls_backend_fallback;
@@ -16,9 +25,8 @@ pub use crate::chatgpt_cloudflare_cookies::with_chatgpt_cloudflare_cookie_store;
 pub use crate::chatgpt_hosts::is_allowed_chatgpt_host;
 pub use crate::client::HttpClient;
 pub use crate::client::HttpError;
-pub use crate::client::HttpResponse;
-pub use crate::client::RequestBuilder;
 pub use crate::client_builder::HttpClientBuilder;
+pub use crate::client_tls::HttpClientTlsConfig;
 pub use crate::custom_ca::BuildCustomCaTransportError;
 /// Test-only subprocess hook for custom CA coverage.
 ///
@@ -56,9 +64,11 @@ pub use crate::request::Request;
 pub use crate::request::RequestBody;
 pub use crate::request::RequestCompression;
 pub use crate::request::Response;
+pub use crate::request_builder::RequestBuilder;
+pub use crate::response::HttpResponse;
+pub use crate::retry_after::RetryAfter;
 pub use crate::route_aware_client_pool::RouteAwareClientPool;
 pub use crate::route_aware_client_pool::RouteAwareClientPoolError;
-pub use crate::route_aware_client_pool::RouteAwareRequestBuilder;
 pub use crate::route_aware_client_pool::RouteAwareRequestError;
 pub use crate::transport::ByteStream;
 pub use crate::transport::HttpTransport;
@@ -66,7 +76,36 @@ pub use crate::transport::ReqwestTransport;
 pub use crate::transport::StreamResponse;
 
 #[cfg(windows)]
+mod windows_proxy_auth;
+#[cfg(windows)]
 mod windows_tls;
 
 #[cfg(windows)]
+pub use crate::windows_proxy_auth::WindowsProxyTls;
+#[cfg(windows)]
+pub use crate::windows_proxy_auth::connect_windows_proxy;
+#[cfg(windows)]
 pub use crate::windows_tls::build_windows_platform_tls_config;
+
+/// Validates HTTPS or loopback HTTP endpoints, rejecting userinfo and fragments.
+/// Errors identify the caller-supplied field without including the URL.
+pub fn validate_endpoint_url(value: &str, field: &str) -> Result<Url, String> {
+    let url = Url::parse(value).map_err(|_| format!("invalid {field} URL"))?;
+    let loopback = match url.host() {
+        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(host)) => host.is_loopback(),
+        Some(Host::Ipv6(host)) => host.is_loopback(),
+        None => false,
+    };
+    if url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || !(url.scheme() == "https" || (url.scheme() == "http" && loopback))
+    {
+        return Err(format!(
+            "{field} must use HTTPS (or loopback HTTP), without userinfo or a fragment"
+        ));
+    }
+    Ok(url)
+}

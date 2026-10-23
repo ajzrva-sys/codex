@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::sync::OnceLock;
 
 const GUARDIAN_INSTRUCTIONS_PREFIX: &str = "You are judging one planned coding-agent action.";
+const GUARDIAN_PROVENANCE_PREFIX: &str = "# Transcript provenance\n";
 
 #[derive(Clone, Copy)]
 pub(super) enum TextSource<'a> {
@@ -54,12 +55,12 @@ impl Normalizer {
         };
         let text = normalize_line_endings(&text);
         let segment = known_segment_name(&text, source);
-        let text = self.normalize_values(&text);
         let text = match segment.as_deref() {
             Some("PERMISSIONS_INSTRUCTIONS") => self.permissions(&text),
             Some("ENVIRONMENT_CONTEXT") => self.environment(&text),
             _ => text,
         };
+        let text = self.normalize_values(&text);
         if options.rewrite_known_segments
             && let Some(segment) = segment
         {
@@ -109,15 +110,22 @@ impl Normalizer {
     }
 
     fn normalize_values(&mut self, text: &str) -> String {
-        // Code Mode reports elapsed wall time in an otherwise stable tool output header.
-        let text = if text.starts_with("Script completed\nWall time ") {
+        // Tool calls report elapsed times in an otherwise stable output header.
+        let text = if text.starts_with("Script ") || text.starts_with("Wall time: ") {
             static WALL_TIME: OnceLock<Regex> = OnceLock::new();
             WALL_TIME
                 .get_or_init(|| {
-                    Regex::new(r"(?m)^Wall time [0-9]+(?:\.[0-9]+)? seconds$")
-                        .expect("code mode wall time regex")
+                    Regex::new(r"(?m)^(Wall time:?) [0-9]+(?:\.[0-9]+)? seconds( \(code-mode [0-9]+(?:\.[0-9]+)? seconds; overhead -?[0-9]+(?:\.[0-9]+)? seconds\))?$")
+                        .expect("tool wall time regex")
                 })
-                .replace(text, "Wall time <DURATION> seconds")
+                .replace(text, |captures: &regex_lite::Captures<'_>| {
+                    let prefix = &captures[1];
+                    if captures.get(2).is_some() {
+                        format!("{prefix} <DURATION> seconds (code-mode <DURATION> seconds; overhead <DURATION> seconds)")
+                    } else {
+                        format!("{prefix} <DURATION> seconds")
+                    }
+                })
                 .into_owned()
         } else {
             text.to_string()
@@ -290,11 +298,13 @@ fn known_segment_name(text: &str, source: TextSource<'_>) -> Option<String> {
     let prefixes: &[(&str, &str)] = match source {
         TextSource::ModelInstructions => &[
             (GUARDIAN_INSTRUCTIONS_PREFIX, "GUARDIAN_INSTRUCTIONS"),
+            (GUARDIAN_PROVENANCE_PREFIX, "GUARDIAN_INSTRUCTIONS"),
             ("", "MODEL_INSTRUCTIONS"),
         ],
-        TextSource::Message("developer") => {
-            &[(GUARDIAN_INSTRUCTIONS_PREFIX, "GUARDIAN_INSTRUCTIONS")]
-        }
+        TextSource::Message("developer") => &[
+            (GUARDIAN_INSTRUCTIONS_PREFIX, "GUARDIAN_INSTRUCTIONS"),
+            (GUARDIAN_PROVENANCE_PREFIX, "GUARDIAN_INSTRUCTIONS"),
+        ],
         TextSource::Message("user") => &[
             ("# AGENTS.md instructions", "AGENTS_MD"),
             (
@@ -323,6 +333,7 @@ fn known_segment_name(text: &str, source: TextSource<'_>) -> Option<String> {
                 | "collaboration_mode"
                 | "multi_agent_role"
                 | "multi_agent_mode"
+                | "model_catalog"
                 | "apps_instructions"
                 | "skills_instructions"
                 | "plugins_instructions"
@@ -489,13 +500,21 @@ pub(super) fn portable_tool_schema(tool: &Value) -> Value {
     if definition.get("name").and_then(Value::as_str) != Some("exec_command") {
         return stable;
     }
-    if let Some(Value::String(description)) = definition.get_mut("description")
-        && description.strip_prefix(BASE).is_some_and(|rest| {
-            rest.starts_with("\n\nWindows safety rules:")
-                && fnv1a(normalize_line_endings(rest).as_bytes()) == WINDOWS_SAFETY_SUFFIX_HASH
-        })
-    {
-        *description = BASE.to_string();
+    if let Some(Value::String(description)) = definition.get_mut("description") {
+        if let Some(rest) = description.strip_prefix(BASE) {
+            let suffix = rest
+                .split_once("\n\nexec tool declaration:")
+                .map_or(rest, |(suffix, _)| suffix);
+            if suffix.starts_with("\n\nWindows safety rules:")
+                && fnv1a(normalize_line_endings(suffix).as_bytes()) == WINDOWS_SAFETY_SUFFIX_HASH
+            {
+                *description = format!("{BASE}{}", &rest[suffix.len()..]);
+            }
+        }
+        *description = description.replace(
+            &format!("  // {WINDOWS_WAIT}"),
+            &format!("  // {UNIX_WAIT}"),
+        );
     }
     if let Some(Value::String(wait)) =
         definition.pointer_mut("/parameters/properties/yield_time_ms/description")

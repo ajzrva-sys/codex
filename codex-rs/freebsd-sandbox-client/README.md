@@ -25,3 +25,11 @@ not remove secrets that the caller intentionally places in the launch request.
 The protocol retains its existing 1 MiB frame limit and 16 KiB stream chunks.
 The service owns dedicated pipes/PTYs, identity changes, mounts, cancellation,
 and cleanup. Callers do not pass host filesystem descriptors into workloads.
+
+The standalone `codex-freebsd-sandbox-client` relay is installed beside the
+root-owned daemon. `capabilities` validates the service and prints its JSON
+capabilities. `run --permissions-json JSON -- /absolute/program [args...]`
+validates capabilities, then launches with the current directory as both command
+and policy cwd, the inherited caller-selected environment, and pipes rather
+than a PTY. The relay prints neither launch arguments nor environment values.
+Callers must clear and explicitly populate the relay environment before launch.

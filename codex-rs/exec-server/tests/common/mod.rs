@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use codex_exec_server::CODEX_ARG0_EXEC_HELPER_ARG1;
 use codex_exec_server::CODEX_FS_HELPER_ARG1;
-use codex_exec_server::ExecServerRuntimePaths;
+use codex_exec_server::ExecServerRuntimeOptions;
 use codex_exec_server::ExecServerTelemetry;
 use codex_exec_server::RequestDispatchMode;
 use codex_http_client::HttpClientFactory;
@@ -17,6 +17,7 @@ use codex_sandboxing::landlock::CODEX_LINUX_SANDBOX_ARG0;
 use codex_test_binary_support::TestBinaryDispatchGuard;
 use codex_test_binary_support::TestBinaryDispatchMode;
 use codex_test_binary_support::configure_test_binary_dispatch;
+#[cfg(not(target_os = "freebsd"))]
 use ctor::ctor;
 
 pub(crate) mod exec_server;
@@ -42,13 +43,27 @@ macro_rules! skip_if_mxc_unavailable {
     }};
 }
 
+#[cfg(not(target_os = "freebsd"))]
 #[ctor]
-pub static TEST_BINARY_DISPATCH_GUARD: Option<TestBinaryDispatchGuard> = {
+pub static TEST_BINARY_DISPATCH_GUARD: Option<TestBinaryDispatchGuard> =
+    initialize_test_binary_dispatch();
+
+// FreeBSD initializes Rust's process arguments after ELF constructors run.
+// The normal-main helper forces this guard once std::env::args is available.
+#[cfg(target_os = "freebsd")]
+pub static TEST_BINARY_DISPATCH_GUARD: std::sync::LazyLock<Option<TestBinaryDispatchGuard>> =
+    std::sync::LazyLock::new(initialize_test_binary_dispatch);
+
+fn initialize_test_binary_dispatch() -> Option<TestBinaryDispatchGuard> {
     let guard = configure_test_binary_dispatch("codex-exec-server-tests", |exe_name, argv1| {
         if argv1 == Some(CODEX_ARG0_EXEC_HELPER_ARG1) {
             return TestBinaryDispatchMode::DispatchArg0Only;
         }
         if argv1 == Some(CODEX_FS_HELPER_ARG1) {
+            return TestBinaryDispatchMode::DispatchArg0Only;
+        }
+        #[cfg(target_os = "freebsd")]
+        if argv1 == Some("--internal-freebsd-sandbox") {
             return TestBinaryDispatchMode::DispatchArg0Only;
         }
         if argv1 == Some(CODEX_WINDOWS_SANDBOX_ARG1) {
@@ -65,10 +80,13 @@ pub static TEST_BINARY_DISPATCH_GUARD: Option<TestBinaryDispatchGuard> = {
     maybe_run_delayed_output_after_exit_from_test_binary();
     maybe_run_exec_server_from_test_binary(guard.as_ref());
     guard
-};
+}
 
 pub(crate) fn current_test_binary_helper_paths() -> anyhow::Result<(PathBuf, Option<PathBuf>)> {
+    #[cfg(not(target_os = "freebsd"))]
     let current_exe = env::current_exe()?;
+    #[cfg(target_os = "freebsd")]
+    let current_exe = codex_utils_cargo_bin::cargo_bin("examples/freebsd-exec-server-test-helper")?;
     let codex_linux_sandbox_exe = if cfg!(target_os = "linux") {
         TEST_BINARY_DISPATCH_GUARD
             .as_ref()
@@ -165,6 +183,17 @@ fn maybe_run_exec_server_from_test_binary(guard: Option<&TestBinaryDispatchGuard
     if command != "exec-server" {
         return;
     }
+    // Enable requested child diagnostics so integration tests can observe background failures.
+    if env::var_os("RUST_LOG").is_some()
+        && let Err(error) = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .try_init()
+    {
+        eprintln!("failed to initialize executor test logging: {error}");
+        std::process::exit(1);
+    }
     // Initialize in the executor child, just as the real CLI does at startup.
     codex_build_info::BuildInfo::initialize(TEST_BUILD_COMMIT);
 
@@ -203,7 +232,7 @@ fn maybe_run_exec_server_from_test_binary(guard: Option<&TestBinaryDispatchGuard
             std::process::exit(1);
         }
     };
-    let runtime_paths = match ExecServerRuntimePaths::new(
+    let mut runtime_paths = match ExecServerRuntimeOptions::new(
         current_exe.clone(),
         linux_sandbox_exe(guard, &current_exe),
     ) {
@@ -213,6 +242,14 @@ fn maybe_run_exec_server_from_test_binary(guard: Option<&TestBinaryDispatchGuard
             std::process::exit(1);
         }
     };
+    runtime_paths.prefer_mxc = env::var("CODEX_EXEC_SERVER_TEST_PREFER_MXC")
+        .ok()
+        .map(|value| {
+            value.parse().unwrap_or_else(|error| {
+                eprintln!("invalid test MXC preference: {error}");
+                std::process::exit(1);
+            })
+        });
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -262,6 +299,7 @@ fn maybe_run_exec_server_from_test_binary(guard: Option<&TestBinaryDispatchGuard
             ExecServerTelemetry::default(),
             http_client_factory,
             request_dispatch_mode,
+            codex_websocket_auth::WebsocketAuthSettings::default(),
         )
         .await
     }) {

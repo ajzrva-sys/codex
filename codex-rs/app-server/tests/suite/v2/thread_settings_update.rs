@@ -235,7 +235,13 @@ async fn thread_settings_update_emits_notification_and_updates_future_turns() ->
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
     write_models_cache(codex_home.path()).await?;
-    let (model_id, service_tier_id) = service_tier_model_and_tier_id()?;
+    let (_, service_tier_id) = service_tier_model_and_tier_id()?;
+    let model_id = all_model_presets()
+        .iter()
+        .find(|preset| preset.service_tiers.is_empty())
+        .context("bundled model catalog should include a model without service tiers")?
+        .id
+        .clone();
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -265,8 +271,6 @@ async fn thread_settings_update_emits_notification_and_updates_future_turns() ->
         "settings-only update should not start a model request"
     );
 
-    start_text_turn(&mut mcp, thread.id.clone()).await?;
-
     let updated = read_thread_settings_updated(&mut mcp).await?;
     assert_eq!(updated.thread_id, thread.id);
     assert_eq!(updated.thread_settings.model, model_id);
@@ -274,6 +278,8 @@ async fn thread_settings_update_emits_notification_and_updates_future_turns() ->
         updated.thread_settings.service_tier.as_deref(),
         Some(service_tier_id.as_str())
     );
+
+    start_text_turn(&mut mcp, thread.id.clone()).await?;
 
     timeout(
         DEFAULT_TIMEOUT,
@@ -345,10 +351,9 @@ async fn thread_settings_update_emits_notification_and_updates_future_turns() ->
     assert!(
         request_bodies.iter().any(|body| {
             body.get("model").and_then(Value::as_str) == Some(model_id.as_str())
-                && body.get("service_tier").and_then(Value::as_str)
-                    == Some(service_tier_id.as_str())
+                && body.get("service_tier").is_none()
         }),
-        "future turn did not use updated model/service tier: {request_bodies:#?}"
+        "future turn did not omit the unsupported service tier: {request_bodies:#?}"
     );
     Ok(())
 }
@@ -701,4 +706,71 @@ fn create_config_toml(codex_home: &std::path::Path, server_uri: &str) -> std::io
         .with_root_config("compact_prompt = \"compact\"\nmodel_auto_compact_token_limit = 200000")
         .with_provider_config("supports_websockets = false")
         .write(codex_home)
+}
+
+#[tokio::test]
+async fn thread_settings_update_preserves_session_profiles() -> Result<()> {
+    for (profile_on_disk, top_level_selection) in [(false, false), (true, false), (true, true)] {
+        let home = TempDir::new()?;
+        let profile = json!({"extends": ":read-only"});
+        std::fs::write(
+            home.path().join("config.toml"),
+            if profile_on_disk {
+                "default_permissions = ':read-only'\n[permissions.audit]\nextends = ':read-only'\n"
+            } else {
+                ""
+            },
+        )?;
+        write_models_cache(home.path()).await?;
+        let mut server = TestAppServer::builder()
+            .with_codex_home(home.path())
+            .build_initialized_with_timeout(DEFAULT_TIMEOUT)
+            .await?;
+        let mut config = std::collections::HashMap::from([
+            ("default_permissions".to_string(), json!("audit")),
+            ("features.guardian_approval".to_string(), json!(true)),
+        ]);
+        if !profile_on_disk {
+            config.insert("permissions.audit".to_string(), profile);
+        }
+        if top_level_selection {
+            config.remove("default_permissions");
+        }
+        let id = server
+            .send_thread_start_request_with_auto_env(ThreadStartParams {
+                model: Some("mock-model".to_string()),
+                config: Some(config),
+                permissions: top_level_selection.then(|| "audit".to_string()),
+                ..Default::default()
+            })
+            .await?;
+        let started: ThreadStartResponse =
+            timeout(DEFAULT_TIMEOUT, server.read_response(id)).await??;
+        let thread_id = started.thread.id;
+        for profile_id in [":workspace", "audit"] {
+            let id = server
+                .send_thread_settings_update_request(ThreadSettingsUpdateParams {
+                    thread_id: thread_id.clone(),
+                    permissions: Some(profile_id.to_string()),
+                    ..Default::default()
+                })
+                .await?;
+            let _: ThreadSettingsUpdateResponse =
+                timeout(DEFAULT_TIMEOUT, server.read_response(id)).await??;
+            let applied: ThreadSettingsUpdatedNotification = timeout(
+                DEFAULT_TIMEOUT,
+                server.read_notification("thread/settings/updated"),
+            )
+            .await??;
+            assert_eq!(
+                applied
+                    .thread_settings
+                    .active_permission_profile
+                    .unwrap()
+                    .id,
+                profile_id
+            );
+        }
+    }
+    Ok(())
 }

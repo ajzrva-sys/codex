@@ -2,7 +2,7 @@
 
 use crate::agent::AgentStatus;
 use crate::agent::agent_resolver::resolve_agent_target;
-use crate::agent::control::AgentMessage;
+use crate::agent::types::AgentMessage;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
@@ -58,6 +58,7 @@ fn agent_message_from_tool(
     if matches!(
         source,
         crate::tools::context::ToolCallSource::DirectPlaintextMessage
+            | crate::tools::context::ToolCallSource::CodeMode { .. }
     ) {
         AgentMessage::Plaintext(message)
     } else {

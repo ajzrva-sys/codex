@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::sandbox::SandboxOverride;
 use codex_sandboxing::SandboxExecRequest;
 use codex_sandboxing::SandboxType;
 use codex_utils_path_uri::PathUri;
@@ -11,6 +12,7 @@ use tokio::io::AsyncReadExt;
 fn command(script: &str) -> SandboxExecRequest {
     let cwd = PathUri::from_host_native_path(std::env::current_dir().unwrap()).unwrap();
     SandboxExecRequest {
+        sandbox_override: SandboxOverride::NoOverride,
         command: vec!["/bin/sh".into(), "-c".into(), script.into()],
         cwd: cwd.clone(),
         sandbox_policy_cwd: cwd,
@@ -19,7 +21,6 @@ fn command(script: &str) -> SandboxExecRequest {
         network_environment_id: None,
         sandbox: SandboxType::None,
         windows_sandbox_level: WindowsSandboxLevel::Disabled,
-        windows_sandbox_private_desktop: false,
         permission_profile: PermissionProfile::Disabled,
         arg0: None,
     }
@@ -59,4 +60,21 @@ async fn oversized_or_incomplete_stream_headers_are_rejected() {
         let error = super::open(command(script), Vec::new()).await.unwrap_err();
         assert_eq!(error.message, "invalid fs sandbox stream header");
     }
+}
+
+#[cfg(target_os = "freebsd")]
+#[tokio::test]
+async fn snapshot_replace_is_rejected_before_the_helper_can_truncate() {
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("preserved");
+    std::fs::write(&target, b"preserve").unwrap();
+    let error = crate::sandboxed_file_open::open(
+        command(&format!(": > {}", target.display())),
+        PathUri::from_host_native_path(&target).unwrap(),
+        crate::protocol::FsOpenMode::Replace,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.message.contains("read-only"));
+    assert_eq!(std::fs::read(&target).unwrap(), b"preserve");
 }

@@ -43,7 +43,7 @@ impl CellHost for TestHost {
 
     async fn commit_completion(
         &self,
-        _stored_value_writes: HashMap<String, JsonValue>,
+        _stored_value_writes: HashMap<String, Arc<JsonValue>>,
         event: CellEvent,
         pending_initial_yield_items: Option<Vec<OutputItem>>,
         cell_state: Arc<CellState>,
@@ -75,7 +75,7 @@ impl CellHost for RecordingHost {
 
     async fn commit_completion(
         &self,
-        _stored_value_writes: HashMap<String, JsonValue>,
+        _stored_value_writes: HashMap<String, Arc<JsonValue>>,
         event: CellEvent,
         pending_initial_yield_items: Option<Vec<OutputItem>>,
         cell_state: Arc<CellState>,
@@ -89,6 +89,7 @@ impl CellHost for RecordingHost {
 struct CellActorHarness {
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
     handle: CellHandle,
+    yield_signal: CancellationToken,
     initial_event_rx: oneshot::Receiver<Result<CellEvent, CellError>>,
     task: tokio::task::JoinHandle<()>,
     runtime_control_rx: std_mpsc::Receiver<RuntimeControlCommand>,
@@ -136,6 +137,7 @@ fn spawn_cell_actor_harness_with_host_and_failure_handler<H: CellHost>(
     let (runtime_control_tx, runtime_control_rx) = std_mpsc::channel();
     let cell_state = Arc::new(CellState::new(CancellationToken::new()));
     let handle = CellHandle::new(command_tx, Arc::clone(&cell_state));
+    let yield_signal = CancellationToken::new();
     let task = tokio::spawn(run_cell(
         host,
         CellContext {
@@ -147,7 +149,7 @@ fn spawn_cell_actor_harness_with_host_and_failure_handler<H: CellHost>(
         event_rx,
         command_rx,
         Observer {
-            mode: initial_observe_mode,
+            observation: initial_observe_mode.with_yield_signal(yield_signal.clone()),
             response_tx: initial_event_tx,
         },
         task_failure_handler,
@@ -156,6 +158,7 @@ fn spawn_cell_actor_harness_with_host_and_failure_handler<H: CellHost>(
     CellActorHarness {
         event_tx,
         handle,
+        yield_signal,
         initial_event_rx,
         task,
         runtime_control_rx,
@@ -205,6 +208,7 @@ async fn runtime_thread_panic_remains_a_cell_error_without_owner_supervision() {
         harness.initial_event_rx.await.expect("initial event"),
         Ok(CellEvent::Completed {
             content_items: Vec::new(),
+            result_buffered_for: Duration::ZERO,
             error_text: Some("exec runtime ended unexpectedly".to_string()),
         })
     );
@@ -256,7 +260,17 @@ async fn yield_timer_preempts_buffered_runtime_output() {
 
 #[tokio::test]
 async fn queued_termination_preempts_unobserved_runtime_completion() {
-    let harness = spawn_cell_actor_harness(ObserveMode::YieldAfter(Duration::from_secs(60)));
+    let harness = spawn_cell_actor_harness(ObserveMode::YieldAfter(Duration::ZERO));
+    harness.event_tx.send(RuntimeEvent::Started).unwrap();
+    harness.event_tx.send(RuntimeEvent::YieldRequested).unwrap();
+    harness
+        .event_tx
+        .send(RuntimeEvent::ContentItem(
+            FunctionCallOutputContentItem::InputText {
+                text: "queued output".to_string(),
+            },
+        ))
+        .unwrap();
     harness
         .event_tx
         .send(RuntimeEvent::Result {
@@ -264,10 +278,13 @@ async fn queued_termination_preempts_unobserved_runtime_completion() {
             error_text: None,
         })
         .unwrap();
+    harness.yield_signal.cancel();
     let termination = harness.handle.terminate();
 
     let terminated = Ok(CellEvent::Terminated {
-        content_items: Vec::new(),
+        content_items: vec![OutputItem::Text {
+            text: "queued output".to_string(),
+        }],
     });
     assert_eq!(termination.await, terminated.clone());
     assert_eq!(harness.initial_event_rx.await.unwrap(), terminated);
@@ -453,11 +470,12 @@ async fn dropped_pending_observer_preserves_the_frontier_for_the_next_observatio
     harness.task.await.unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn only_the_first_termination_claims_a_buffered_completion() {
     let cell_state = CellState::new(CancellationToken::new());
     let completion = CellEvent::Completed {
         content_items: Vec::new(),
+        result_buffered_for: Duration::ZERO,
         error_text: None,
     };
     assert_eq!(
@@ -494,6 +512,7 @@ async fn termination_claim_prevents_stored_value_commit() {
     let mut commit_ran = false;
     let completion = CellEvent::Completed {
         content_items: Vec::new(),
+        result_buffered_for: Duration::ZERO,
         error_text: None,
     };
 
@@ -517,11 +536,12 @@ async fn termination_claim_prevents_stored_value_commit() {
     assert_eq!(termination.await, Ok(terminated));
 }
 
-#[test]
-fn failed_completion_delivery_rebuffers_the_event() {
+#[tokio::test(start_paused = true)]
+async fn failed_completion_delivery_rebuffers_the_event() {
     let cell_state = CellState::new(CancellationToken::new());
     let event = CellEvent::Completed {
         content_items: Vec::new(),
+        result_buffered_for: Duration::ZERO,
         error_text: None,
     };
     assert_eq!(
@@ -548,13 +568,14 @@ fn failed_completion_delivery_rebuffers_the_event() {
     assert_eq!(response_rx.try_recv(), Ok(Ok(event)));
 }
 
-#[test]
-fn buffered_initial_yield_precedes_buffered_completion_for_yield_observer() {
+#[tokio::test(start_paused = true)]
+async fn buffered_initial_yield_precedes_buffered_completion_for_yield_observer() {
     let cell_state = CellState::new(CancellationToken::new());
     let completion = CellEvent::Completed {
         content_items: vec![OutputItem::Text {
             text: "after".to_string(),
         }],
+        result_buffered_for: Duration::ZERO,
         error_text: None,
     };
     assert_eq!(
@@ -594,8 +615,8 @@ fn buffered_initial_yield_precedes_buffered_completion_for_yield_observer() {
     assert_eq!(response_rx.try_recv(), Ok(Ok(completion)));
 }
 
-#[test]
-fn pending_observer_merges_initial_yield_and_completion_output() {
+#[tokio::test(start_paused = true)]
+async fn pending_observer_merges_initial_yield_and_completion_output() {
     let cell_state = CellState::new(CancellationToken::new());
     assert_eq!(
         cell_state.commit_completion(
@@ -603,6 +624,7 @@ fn pending_observer_merges_initial_yield_and_completion_output() {
                 content_items: vec![OutputItem::Text {
                     text: "after".to_string(),
                 }],
+                result_buffered_for: Duration::ZERO,
                 error_text: None,
             },
             Some(vec![OutputItem::Text {
@@ -617,6 +639,8 @@ fn pending_observer_merges_initial_yield_and_completion_output() {
         CompletionDelivery::Buffered
     ));
 
+    let buffered = Duration::from_secs(30);
+    tokio::time::advance(buffered).await;
     let (response_tx, mut response_rx) = oneshot::channel();
     assert!(matches!(
         cell_state.route_observation(ObserveMode::PendingFrontier, response_tx),
@@ -633,18 +657,20 @@ fn pending_observer_merges_initial_yield_and_completion_output() {
                     text: "after".to_string(),
                 },
             ],
+            result_buffered_for: buffered,
             error_text: None,
         }))
     );
 }
 
-#[test]
-fn dropped_pending_observation_preserves_the_initial_yield_boundary() {
+#[tokio::test(start_paused = true)]
+async fn dropped_pending_observation_preserves_the_initial_yield_boundary() {
     let cell_state = CellState::new(CancellationToken::new());
     let completion = CellEvent::Completed {
         content_items: vec![OutputItem::Text {
             text: "after".to_string(),
         }],
+        result_buffered_for: Duration::ZERO,
         error_text: None,
     };
     assert_eq!(

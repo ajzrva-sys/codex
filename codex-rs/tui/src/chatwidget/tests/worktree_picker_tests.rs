@@ -1,12 +1,14 @@
 //! Worktree picker behavior and rendered choices.
 
 use super::*;
+use crate::worktree_browser::Entry;
+use crate::worktree_browser::Owner;
 use pretty_assertions::assert_eq;
 
 #[tokio::test]
 async fn slash_new_and_fork_offer_checkout_choices_inside_local_git_repository() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-    chat.set_feature_enabled(Feature::Worktrees, /*enabled*/ false);
+    chat.set_local_worktree_operations(/*enabled*/ false);
     let checkout = tempdir().expect("temporary checkout");
     std::fs::create_dir(checkout.path().join(".git")).expect("git directory");
     std::fs::write(checkout.path().join(".git/HEAD"), "ref: refs/heads/main\n").expect("git HEAD");
@@ -21,7 +23,7 @@ async fn slash_new_and_fork_offer_checkout_choices_inside_local_git_repository()
     chat.dispatch_command(SlashCommand::New);
     assert_matches!(rx.try_recv(), Ok(AppEvent::NewSession { name: None }));
 
-    chat.set_feature_enabled(Feature::Worktrees, /*enabled*/ true);
+    chat.set_local_worktree_operations(/*enabled*/ true);
     chat.dispatch_command(SlashCommand::Fork);
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
@@ -30,18 +32,20 @@ async fn slash_new_and_fork_offer_checkout_choices_inside_local_git_repository()
     chat.dispatch_command(SlashCommand::New);
     let popup = render_bottom_popup(&chat, /*width*/ 80);
     assert_chatwidget_snapshot!("worktrees_new_choices", popup);
-    assert!(popup.contains("Current checkout"), "popup: {popup}");
-    assert!(popup.contains("New worktree"), "popup: {popup}");
+    assert!(popup.contains("Use current Git worktree"), "popup: {popup}");
+    assert!(popup.contains("Create new Git worktree"), "popup: {popup}");
     assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
     chat.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     chat.bottom_pane
         .set_composer_text("/new named".into(), Vec::new(), Vec::new());
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_matches!(rx.try_recv(), Ok(AppEvent::FollowTranscript));
     chat.handle_key_event(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
     assert_matches!(rx.try_recv(), Ok(AppEvent::NewSession { name: Some(name) }) if name == "named");
     chat.bottom_pane
         .set_composer_text("/fork named".into(), Vec::new(), Vec::new());
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_matches!(rx.try_recv(), Ok(AppEvent::FollowTranscript));
     chat.handle_key_event(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
     assert_matches!(rx.try_recv(), Ok(AppEvent::StartManagedWorktree {
         mode: crate::app_event::ManagedWorktreeMode::Fork,
@@ -59,7 +63,7 @@ async fn slash_new_and_fork_offer_checkout_choices_inside_local_git_repository()
         (false, "worktrees_command_remote"),
         (true, "worktrees_command_local"),
     ] {
-        chat.set_feature_enabled(Feature::Worktrees, /*enabled*/ true);
+        chat.set_local_worktree_operations(/*enabled*/ true);
         chat.set_local_worktree_operations(available);
         chat.bottom_pane
             .set_composer_text("/work".into(), Vec::new(), Vec::new());
@@ -78,7 +82,7 @@ async fn slash_worktree_offers_current_or_new_conversation() {
     chat.config.cwd =
         AbsolutePathBuf::from_absolute_path(checkout.path()).expect("absolute checkout");
 
-    chat.set_feature_enabled(Feature::Worktrees, /*enabled*/ true);
+    chat.set_local_worktree_operations(/*enabled*/ true);
     chat.dispatch_command(SlashCommand::Worktree);
 
     let popup = render_bottom_popup(&chat, /*width*/ 80);
@@ -101,7 +105,7 @@ async fn worktree_browser_actions_and_stale_results() {
     std::fs::create_dir(checkout.path().join(".git")).unwrap();
     std::fs::write(checkout.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
     chat.config.cwd = AbsolutePathBuf::from_absolute_path(checkout.path()).unwrap();
-    chat.set_feature_enabled(Feature::Worktrees, /*enabled*/ true);
+    chat.set_local_worktree_operations(/*enabled*/ true);
     let request = chat.request_managed_worktrees().unwrap();
     assert_chatwidget_snapshot!(
         "worktree_browser_loading",
@@ -208,7 +212,7 @@ async fn worktree_browser_names_archived_and_missing_owners() {
     std::fs::create_dir(checkout.path().join(".git")).unwrap();
     std::fs::write(checkout.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
     chat.config.cwd = AbsolutePathBuf::from_absolute_path(checkout.path()).unwrap();
-    chat.set_feature_enabled(Feature::Worktrees, /*enabled*/ true);
+    chat.set_local_worktree_operations(/*enabled*/ true);
     let request = chat.request_managed_worktrees().unwrap();
     let owner = ThreadId::from_string("00000000-0000-0000-0000-000000000002").unwrap();
     chat.on_managed_worktrees_loaded(
@@ -255,4 +259,70 @@ async fn worktree_browser_names_archived_and_missing_owners() {
     let popup = render_bottom_popup(&chat, /*width*/ 80);
     assert!(popup.contains("Worktree: Fix settings"), "popup: {popup}");
     assert!(!popup.contains("Resume owner"));
+}
+
+#[tokio::test]
+async fn worktree_picker_custom_keys_preserve_draft_and_protect_current_checkout() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let checkout = tempdir().unwrap();
+    std::fs::create_dir(checkout.path().join(".git")).unwrap();
+    std::fs::write(checkout.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    chat.config.cwd = AbsolutePathBuf::from_absolute_path(checkout.path()).unwrap();
+    chat.set_local_worktree_operations(/*enabled*/ true);
+    let mut keymap = crate::keymap::RuntimeKeymap::defaults();
+    keymap.list.accept = vec![key_hint::plain(KeyCode::F(/*n*/ 3))];
+    keymap.list.cancel = vec![key_hint::plain(KeyCode::F(/*n*/ 2))];
+    chat.bottom_pane.set_keymap_bindings(&keymap);
+    chat.bottom_pane
+        .set_composer_text("Keep this draft".into(), Vec::new(), Vec::new());
+    let request = chat.request_managed_worktrees().unwrap();
+    let entry = Entry {
+        root: PathBuf::from("/repo/日本語"),
+        cwd: PathBuf::from("/repo/日本語/src"),
+        owner: Owner::None,
+    };
+    chat.on_managed_worktrees_loaded(request, Ok(vec![entry.clone()]));
+    for ch in "日本語".chars() {
+        chat.handle_key_event(KeyEvent::from(KeyCode::Char(ch)));
+    }
+    let popup = render_bottom_popup(&chat, /*width*/ 40);
+    assert!(
+        popup.replace(' ', "").contains("/repo/日本語/src"),
+        "{popup}"
+    );
+    assert!(popup.contains("f3 select · f2 back"), "{popup}");
+    chat.handle_key_event(KeyEvent::from(KeyCode::F(/*n*/ 3)));
+    let AppEvent::ShowManagedWorktreeActions {
+        request,
+        entry: selected,
+    } = rx.try_recv().unwrap()
+    else {
+        panic!("expected the filtered worktree");
+    };
+    assert_eq!(selected, entry);
+    chat.show_managed_worktree_actions(request.clone(), selected);
+    chat.handle_key_event(KeyEvent::from(KeyCode::F(/*n*/ 2)));
+    assert!(chat.no_modal_or_popup_active());
+    assert_eq!(chat.bottom_pane.composer_text(), "Keep this draft");
+    assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
+
+    let current = Entry {
+        root: checkout.path().to_path_buf(),
+        cwd: checkout.path().to_path_buf(),
+        owner: Owner::None,
+    };
+    chat.show_managed_worktree_actions(request.clone(), current.clone());
+    let popup = render_bottom_popup(&chat, /*width*/ 80);
+    let unwrapped = popup.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        unwrapped.contains("Switch to another checkout before deleting this one"),
+        "{popup}"
+    );
+    chat.handle_key_event(KeyEvent::from(KeyCode::Char('2')));
+    assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
+    chat.handle_key_event(KeyEvent::from(KeyCode::F(/*n*/ 2)));
+    chat.confirm_managed_worktree_removal(request, current.root);
+    assert!(chat.no_modal_or_popup_active());
+    assert_eq!(chat.bottom_pane.composer_text(), "Keep this draft");
+    assert_matches!(rx.try_recv(), Err(TryRecvError::Empty));
 }

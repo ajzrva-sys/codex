@@ -48,9 +48,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--user", required=True)
     parser.add_argument("--daemon", type=Path, required=True)
+    parser.add_argument("--client", type=Path)
     args = parser.parse_args()
     if os.geteuid() != 0 or os.uname().sysname != "FreeBSD":
         parser.error("run this installer as root on FreeBSD")
+    client = args.client or args.daemon.with_name("codex-freebsd-sandbox-client")
+    # Read both staged artifacts before changing any administrator-owned file.
+    daemon_bytes = args.daemon.read_bytes()
+    client_bytes = client.read_bytes()
     uid = pwd.getpwnam(args.user).pw_uid
     if uid == 0:
         parser.error("the sandbox user must not be root")
@@ -77,7 +82,12 @@ def main() -> None:
     replace_file(config, (json.dumps(settings, indent=2) + "\n").encode(), 0o600)
     replace_file(
         Path("/usr/local/libexec/codex-freebsd-sandboxd"),
-        args.daemon.read_bytes(),
+        daemon_bytes,
+        0o755,
+    )
+    replace_file(
+        Path("/usr/local/libexec/codex-freebsd-sandbox-client"),
+        client_bytes,
         0o755,
     )
     replace_file(Path("/usr/local/etc/rc.d/codex_freebsd_sandbox"), RC.encode(), 0o555)

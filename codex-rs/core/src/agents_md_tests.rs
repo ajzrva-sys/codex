@@ -32,6 +32,7 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::EnvironmentConfig;
 use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::TurnEnvironmentSelection;
+use codex_protocol_test_support::ContentItemTestExt;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
@@ -51,6 +52,7 @@ use tokio::sync::Semaphore;
 
 #[derive(Clone, Copy)]
 enum InjectedFailure {
+    MetadataNotFound,
     Metadata(io::ErrorKind),
     MetadataBlocked,
     MetadataBlockedByFilenamePrefix(&'static str),
@@ -128,13 +130,16 @@ impl FailingFileSystem {
         options: GetMetadataOptions,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> io::Result<FileMetadata> {
-        let path_abs = path.to_abs_path()?;
         self.metadata_calls
             .paths
             .lock()
             .expect("metadata paths lock")
             .push(path.clone());
         self.metadata_calls.started.notify_one();
+        if matches!(self.failure, InjectedFailure::MetadataNotFound) {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
+        let path_abs = path.to_abs_path()?;
         match self.failure {
             InjectedFailure::Metadata(kind) if path_abs == self.path => {
                 Err(io::Error::new(kind, "injected metadata failure"))
@@ -165,7 +170,8 @@ impl FailingFileSystem {
             InjectedFailure::MetadataPending if path_abs == self.path => {
                 std::future::pending().await
             }
-            InjectedFailure::Metadata(_)
+            InjectedFailure::MetadataNotFound
+            | InjectedFailure::Metadata(_)
             | InjectedFailure::MetadataBlocked
             | InjectedFailure::MetadataBlockedByFilenamePrefix(_)
             | InjectedFailure::MetadataPending
@@ -363,14 +369,16 @@ fn resolved_local_environments<const N: usize>(
             .map(|(environment_id, cwd)| {
                 TurnEnvironmentState::Ready(TurnEnvironment::new(
                     TurnEnvironmentSelection {
+                        selected_capability_roots: Default::default(),
                         environment_id: environment_id.to_string(),
                         cwd: PathUri::from_abs_path(&cwd),
                         workspace_roots: Vec::new(),
                         config: EnvironmentConfigState::Ready(EnvironmentConfig {
+                            environment_hooks: Default::default(),
                             allow_login_shell: true,
                             workspace_roots: Vec::new(),
                             windows_sandbox_level: WindowsSandboxLevel::Disabled,
-                            windows_sandbox_private_desktop: true,
+                            windows_sandbox_type: codex_protocol::sandbox::SandboxType::None,
                             use_legacy_landlock: false,
                             permission_profile: PermissionProfileSnapshot::legacy(
                                 PermissionProfile::read_only(),
@@ -430,7 +438,7 @@ fn foreign_agents_md_uses_environment_native_paths() {
     };
 
     assert_eq!(
-        loaded.contextual_user_fragment().render(),
+        loaded.contextual_user_fragment().render().expect_text(),
         format!(
             "# AGENTS.md instructions for {rendered_cwd}
 
@@ -474,7 +482,7 @@ fn multi_environment_agents_md_renders_mixed_path_conventions() {
     };
 
     assert_eq!(
-        loaded.contextual_user_fragment().render(),
+        loaded.contextual_user_fragment().render().expect_text(),
         r#"# AGENTS.md instructions
 
 <INSTRUCTIONS>
@@ -1171,7 +1179,7 @@ secondary doc"#,
 </INSTRUCTIONS>"#
     );
     assert_eq!(
-        loaded.contextual_user_fragment().render(),
+        loaded.contextual_user_fragment().render().expect_text(),
         expected_fragment
     );
     assert_eq!(
@@ -1218,7 +1226,7 @@ async fn secondary_only_project_doc_uses_single_contributor_layout() {
         secondary.path().display()
     );
     assert_eq!(
-        loaded.contextual_user_fragment().render(),
+        loaded.contextual_user_fragment().render().expect_text(),
         expected_fragment
     );
 }
@@ -1248,7 +1256,7 @@ async fn primary_only_project_doc_preserves_legacy_layout_with_multiple_bound_en
         primary.path().display()
     );
     assert_eq!(
-        loaded.contextual_user_fragment().render(),
+        loaded.contextual_user_fragment().render().expect_text(),
         expected_fragment
     );
 }
@@ -1564,6 +1572,72 @@ async fn agents_local_md_preferred() {
         discovery[0].basename().as_deref(),
         Some(LOCAL_AGENTS_MD_FILENAME)
     );
+}
+
+#[tokio::test]
+async fn fallback_paths_are_rejected_before_filesystem_probes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mut cfg = make_config_with_project_root_markers(
+        &tmp,
+        /*limit*/ 4096,
+        /*instructions*/ None,
+        &[],
+    )
+    .await;
+    let windows_paths = [
+        r"..\AGENTS.md",
+        r"nested\AGENTS.md",
+        r"\AGENTS.md",
+        r"C:\AGENTS.md",
+        "C:AGENTS.md",
+        r"\\server\share\AGENTS.md",
+        r"\\?\UNC\server\share\AGENTS.md",
+        r"\\.\pipe\instructions",
+        "AGENTS.md:stream",
+    ];
+    cfg.project_doc_fallback_filenames = [
+        "",
+        ".",
+        "..",
+        "/AGENTS.md",
+        "../AGENTS.md",
+        "nested/AGENTS.md",
+        "//server/share/AGENTS.md",
+        "AGENTS\0.md",
+    ]
+    .into_iter()
+    .chain(windows_paths)
+    .chain(["WORKFLOW.md", "WORKFLOW.md", ".instructions.md"])
+    .map(str::to_owned)
+    .collect();
+
+    // Backslashes and colons are ordinary filename characters on POSIX executors.
+    for (cwd, extra_filenames) in [
+        ("file:///repo", windows_paths.as_slice()),
+        ("file:///C:/repo", &[][..]),
+    ] {
+        let cwd: PathUri = cwd.parse().expect("cwd URI");
+        let metadata_calls = Arc::new(MetadataCallCounts::default());
+        let filesystem = FailingFileSystem {
+            path: tmp.abs(),
+            failure: InjectedFailure::MetadataNotFound,
+            metadata_calls: Arc::clone(&metadata_calls),
+        };
+        let paths = super::agents_md_paths(&cfg, &cwd, &filesystem, /*sandbox*/ None)
+            .await
+            .expect("discover paths");
+
+        assert_eq!(paths, Vec::<PathUri>::new());
+        assert_eq!(
+            *metadata_calls.paths.lock().expect("metadata paths lock"),
+            ["AGENTS.override.md", "AGENTS.md"]
+                .into_iter()
+                .chain(extra_filenames.iter().copied())
+                .chain(["WORKFLOW.md", ".instructions.md"])
+                .map(|name| cwd.join(name).expect("filename"))
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 /// When AGENTS.md is absent but a configured fallback exists, the fallback is used.

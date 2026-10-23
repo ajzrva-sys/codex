@@ -71,6 +71,13 @@ impl ThreadConfigLoader for UnavailableThreadConfig {
 async fn provider_requirements_do_not_reload_thread_config() -> Result<()> {
     let home = tempdir()?;
     let mut manager = ConfigManager::without_managed_config_for_tests(home.path().to_path_buf());
+    manager.thread_config_loader = Arc::new(codex_config::StaticThreadConfigLoader::new(vec![
+        ThreadConfigSource::Session(codex_config::SessionThreadConfig {
+            model_provider: Some("retained".into()),
+            model_providers: toml::from_str("[retained]\nname = 'Retained'")?,
+            ..Default::default()
+        }),
+    ]));
     let current = manager.load_latest_config(/*fallback_cwd*/ None).await?;
     manager.thread_config_loader = Arc::new(UnavailableThreadConfig);
     assert!(
@@ -80,6 +87,15 @@ async fn provider_requirements_do_not_reload_thread_config() -> Result<()> {
             .is_err()
     );
     manager.check_thread_model_provider(&current).await?;
+    manager.cloud_config_bundle = Arc::new(RwLock::new(
+        CloudConfigBundleFixture::loader_with_enterprise_requirement("model_provider = 'retained'"),
+    ));
+    let retained = manager
+        .load_retained_session_config(&current.config_layer_stack, &current.cwd)
+        .await?;
+    assert_eq!(retained.model_provider, current.model_provider);
+    let factory = current.http_client_factory();
+    assert_eq!(retained.http_client_factory(), factory);
 
     manager.cloud_config_bundle = Arc::new(RwLock::new(
         CloudConfigBundleFixture::loader_with_enterprise_requirement("model_provider = 'other'"),
@@ -192,5 +208,28 @@ async fn provider_requirement_load_errors_reject_input() -> Result<()> {
                 .is_err()
         );
     }
+    Ok(())
+}
+
+/// A managed startup selection must disappear when its policy is removed.
+#[tokio::test]
+async fn catalog_reload_uses_latest_model_provider() -> Result<()> {
+    let home = tempdir()?;
+    let manager = ConfigManager::new_for_tests(
+        home.path().to_path_buf(),
+        Vec::new(),
+        LoaderOverrides::without_managed_config_for_tests(),
+        CloudConfigBundleFixture::loader_with_enterprise_requirement(
+            "model_provider = 'gateway'\n[model_providers.gateway]\nname = 'Gateway'\nbase_url = 'https://example.test'",
+        ),
+    );
+    let startup = manager.load_non_project_config().await?;
+    assert_eq!(startup.model_provider_id, "gateway");
+    manager.clear_cloud_config_bundle_loader();
+    let refreshed = manager
+        .load_startup_config(/*fallback_cwd*/ None)
+        .await?
+        .config;
+    assert_eq!(refreshed.model_provider_id, "openai");
     Ok(())
 }

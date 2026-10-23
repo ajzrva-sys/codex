@@ -5,14 +5,13 @@ use insta::assert_snapshot;
 use pretty_assertions::assert_eq;
 use tokio::sync::mpsc::unbounded_channel;
 
-fn render_view_lines(view: &UserVerificationView, width: u16) -> String {
-    let height = view.desired_height(width);
+fn render_view_lines(view: &UserVerificationView, width: u16, height: u16) -> String {
     let mut buf = Buffer::empty(Rect::new(0, 0, width, height));
     view.render(Rect::new(0, 0, width, height), &mut buf);
     (0..buf.area.height)
         .map(|row| {
             (0..buf.area.width)
-                .map(|col| buf[(col, row)].symbol().to_string())
+                .map(|col| crate::terminal_hyperlinks::strip_osc8(buf[(col, row)].symbol()))
                 .collect::<String>()
                 .trim_end()
                 .to_string()
@@ -60,16 +59,16 @@ fn prompt_snapshot() {
     let (view, _app_rx) = make_view();
     assert_snapshot!(
         "user_verification_prompt",
-        render_view_lines(&view, /*width*/ 80)
+        render_view_lines(&view, /*width*/ 80, view.desired_height(/*width*/ 80))
     );
 }
 
 #[test]
-fn title_wraps_at_narrow_widths() {
+fn clipped_prompt_exposes_fullscreen_hint() {
     let (view, _app_rx) = make_view();
     assert_snapshot!(
         "user_verification_narrow",
-        render_view_lines(&view, /*width*/ 20)
+        render_view_lines(&view, /*width*/ 40, /*height*/ 8)
     );
 }
 
@@ -79,7 +78,7 @@ fn waiting_snapshot_and_duplicate_approval_suppression() {
     view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_snapshot!(
         "user_verification_waiting",
-        render_view_lines(&view, /*width*/ 80)
+        render_view_lines(&view, /*width*/ 80, view.desired_height(/*width*/ 80))
     );
     view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(
@@ -158,7 +157,7 @@ fn full_screen_request_is_available_before_and_during_verification() {
 
 #[test]
 fn long_url_tokens_remain_visible_in_a_narrow_verification_prompt() {
-    let (view, _) = make_view_for_request(UserVerificationRequest {
+    let (mut view, _) = make_view_for_request(UserVerificationRequest {
         title: "Approve https://example.com/production/release/candidate?".to_string(),
         description: "Deploy https://example.com/production/critical-release-candidate".to_string(),
         thread_label: None,
@@ -167,8 +166,40 @@ fn long_url_tokens_remain_visible_in_a_narrow_verification_prompt() {
     });
     assert_snapshot!(
         "user_verification_long_urls",
-        render_view_lines(&view, /*width*/ 30)
+        render_view_lines(&view, /*width*/ 30, view.desired_height(/*width*/ 30))
     );
+    let urls = [
+        "https://example.com/production/release/candidate?",
+        "https://example.com/production/critical-release-candidate",
+    ];
+    for waiting in [false, true] {
+        if waiting {
+            view.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        let area = Rect::new(0, 0, 30, view.desired_height(/*width*/ 30));
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf);
+        let linked = buf
+            .content
+            .iter()
+            .filter(|cell| cell.symbol().contains("\x1b]8;;"))
+            .map(|cell| {
+                assert!(
+                    urls.iter()
+                        .any(|url| cell.symbol().starts_with(&format!("\x1b]8;;{url}\x07")))
+                );
+                crate::terminal_hyperlinks::strip_osc8(cell.symbol())
+            })
+            .collect::<String>();
+        assert_eq!(
+            linked,
+            if waiting {
+                urls[1].to_owned()
+            } else {
+                urls.concat()
+            }
+        );
+    }
 }
 
 #[tokio::test]

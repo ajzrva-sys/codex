@@ -1,11 +1,23 @@
 mod account;
+#[path = "account_system_proxy_tests.rs"]
+mod account_system_proxy;
+
+mod account_gcp;
 mod account_thread_usage;
+mod agent_message_board;
 mod analytics;
 mod app_installed;
 mod app_list;
 mod app_read;
+mod application_network;
 mod attestation;
+#[path = "auth_storage_originator_tests.rs"]
+mod auth_storage_originator;
 mod auto_env;
+#[path = "bedrock_gov_cloud_tests.rs"]
+mod bedrock_gov_cloud;
+#[path = "bedrock_service_tier_tests.rs"]
+mod bedrock_service_tier;
 mod bedrock_setup;
 mod client_metadata;
 mod code_mode_host;
@@ -18,6 +30,7 @@ mod config_model_provider_requirements;
 mod config_requirements_application;
 #[path = "config_requirements_browser_use_tests.rs"]
 mod config_requirements_browser_use;
+mod config_requirements_desktop;
 #[path = "config_requirements_exec_tests.rs"]
 mod config_requirements_exec;
 mod config_requirements_in_app_browser;
@@ -27,6 +40,8 @@ mod config_rpc;
 #[path = "connection_handling_stdio_tests.rs"]
 mod connection_handling_stdio;
 mod connection_handling_websocket;
+#[path = "connection_handling_websocket_compression_tests.rs"]
+mod connection_handling_websocket_compression;
 #[cfg(unix)]
 mod connection_handling_websocket_unix;
 #[cfg(unix)]
@@ -43,12 +58,17 @@ mod exec_server_test_support;
 #[cfg(not(target_os = "windows"))]
 mod executor_mcp;
 mod executor_skills;
+#[path = "executor_skills_spawn_tests.rs"]
+mod executor_skills_spawn;
 mod experimental_api;
 mod experimental_feature_list;
 mod external_agent_config;
 mod external_agent_import_sync;
 mod feedback;
+mod frozen_cloud_skills;
 mod fs;
+#[path = "gateway_oauth_tests.rs"]
+mod gateway_oauth;
 mod git_attribution;
 mod guardian_v2;
 mod history_notes_extension;
@@ -72,6 +92,7 @@ mod memory_reset;
 mod misalignment_policy;
 mod model_auto_review;
 mod model_list;
+mod model_list_requirements_tests;
 mod model_provider_capabilities_read;
 #[path = "model_provider_enforcement_tests.rs"]
 mod model_provider_enforcement;
@@ -82,6 +103,7 @@ mod permission_profile_list;
 mod plan_item;
 mod plugin_install;
 mod plugin_list;
+mod plugin_manifest_cache;
 mod plugin_read;
 mod plugin_reconcile;
 mod plugin_search;
@@ -103,6 +125,8 @@ mod request_user_input;
 mod request_validation;
 mod residency;
 mod review;
+#[path = "rollout_compress_tests.rs"]
+mod rollout_compress;
 mod rollout_migration;
 mod safety_check_downgrade;
 #[cfg(not(target_os = "windows"))]
@@ -113,6 +137,7 @@ mod server_diagnostics;
 mod session_end;
 mod skills_list;
 mod sleep;
+mod sqlite_recovery;
 mod thread_archive;
 mod thread_attachments;
 mod thread_delete;
@@ -126,11 +151,14 @@ mod thread_list;
 mod thread_loaded_list;
 mod thread_memory_mode_set;
 mod thread_metadata_update;
+mod thread_name_persistence;
 mod thread_name_websocket;
 mod thread_queue;
 mod thread_read;
+mod thread_read_state;
 mod thread_resume;
 mod thread_revert;
+mod thread_sample;
 mod thread_sections;
 mod thread_settings_update;
 mod thread_shell_command;
@@ -138,12 +166,12 @@ mod thread_start;
 mod thread_status;
 mod thread_timeline;
 mod thread_unarchive;
+mod thread_unload;
 mod thread_unsubscribe;
 mod turn_cost_otel;
 mod turn_interrupt;
 mod turn_settings_update;
 mod turn_start;
-mod turn_start_zsh_fork;
 mod turn_steer;
 mod view_image;
 mod web_search;

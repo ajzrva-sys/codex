@@ -1,4 +1,5 @@
 use codex_app_server_protocol::DynamicToolCallOutputContentItem;
+use codex_app_server_protocol::GeneratedImageRef;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::UserInput;
@@ -57,6 +58,7 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
         ServerNotification::Error(_)
         | ServerNotification::ThreadStarted(_)
         | ServerNotification::ThreadStatusChanged(_)
+        | ServerNotification::ThreadReadStateChanged(_)
         | ServerNotification::ThreadArchived(_)
         | ServerNotification::ThreadDeleted(_)
         | ServerNotification::ThreadUnarchived(_)
@@ -66,6 +68,7 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
         | ServerNotification::ThreadNameUpdated(_)
         | ServerNotification::ThreadAttachmentUpdated(_)
         | ServerNotification::ThreadGoalUpdated(_)
+        | ServerNotification::ThreadPredictionUpdated(_)
         | ServerNotification::ThreadGoalCleared(_)
         | ServerNotification::ThreadQueueChanged(_)
         | ServerNotification::ProjectChanged(_)
@@ -134,7 +137,8 @@ pub(crate) fn without_notification_media(notification: ServerNotification) -> Se
         | ServerNotification::ThreadRealtimeClosed(_)
         | ServerNotification::WindowsWorldWritableWarning(_)
         | ServerNotification::WindowsSandboxSetupCompleted(_)
-        | ServerNotification::AccountLoginCompleted(_) => notification,
+        | ServerNotification::AccountLoginCompleted(_)
+        | ServerNotification::GatewayOAuthChanged(_) => notification,
     }
 }
 
@@ -187,7 +191,11 @@ fn without_thread_item_media(mut item: ThreadItem) -> ThreadItem {
                     .is_none()
             });
         }
-        ThreadItem::ImageGeneration(item) => item.result.clear(),
+        ThreadItem::ImageGeneration(item) => {
+            item.image = GeneratedImageRef::Inline {
+                result: String::new(),
+            };
+        }
         ThreadItem::HookPrompt { .. }
         | ThreadItem::AgentMessage { .. }
         | ThreadItem::Plan { .. }

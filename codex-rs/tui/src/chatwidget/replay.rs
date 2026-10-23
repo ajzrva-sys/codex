@@ -102,6 +102,9 @@ impl ChatWidget {
     /// avoid triggering side effects. Event ids are passed as `None` to
     /// distinguish replayed events from live ones.
     pub(crate) fn replay_thread_turns(&mut self, turns: Vec<Turn>, replay_kind: ReplayKind) {
+        if !turns.is_empty() || matches!(replay_kind, ReplayKind::ThreadSnapshot) {
+            self.bottom_pane.dismiss_composer_sparkle();
+        }
         if matches!(replay_kind, ReplayKind::ThreadSnapshot) && !turns.is_empty() {
             self.warning_display_state.startup_complete = true;
         }
@@ -123,6 +126,7 @@ impl ChatWidget {
             }
             let Turn {
                 id: turn_id,
+                root_turn_id,
                 items_view: _,
                 items,
                 status,
@@ -142,7 +146,7 @@ impl ChatWidget {
                 self.warning_display_state.startup_complete = true;
                 self.turn_lifecycle.last_turn_id = Some(turn_id.clone());
                 self.last_non_retry_error = None;
-                self.on_task_started();
+                self.on_replayed_task_started(started_at);
             }
             let trailing_reasoning_id = (status == TurnStatus::InProgress)
                 .then(|| items.last())
@@ -221,6 +225,7 @@ impl ChatWidget {
                         thread_id: self.thread_id.map(|id| id.to_string()).unwrap_or_default(),
                         turn: Turn {
                             id: turn_id,
+                            root_turn_id,
                             items_view: codex_app_server_protocol::TurnItemsView::NotLoaded,
                             items: Vec::new(),
                             status,
@@ -242,7 +247,21 @@ impl ChatWidget {
         turn_id: String,
         replay_kind: ReplayKind,
     ) {
-        self.handle_thread_item(item, turn_id, ThreadItemRenderSource::Replay(replay_kind));
+        match item {
+            // Snapshots contain the completed item, without the live start that renders its diff.
+            ThreadItem::FileChange {
+                changes,
+                status: codex_app_server_protocol::PatchApplyStatus::Completed,
+                ..
+            } => {
+                if !changes.is_empty() {
+                    self.on_patch_apply_begin(file_update_changes_to_display(changes));
+                }
+            }
+            item => {
+                self.handle_thread_item(item, turn_id, ThreadItemRenderSource::Replay(replay_kind));
+            }
+        }
     }
 
     pub(super) fn handle_thread_item(
@@ -257,6 +276,19 @@ impl ChatWidget {
             ThreadItem::UserMessage {
                 content, client_id, ..
             } => {
+                if let Some(replies) = crate::async_question_reply::parse_input(&content) {
+                    let ids = replies
+                        .into_iter()
+                        .map(|reply| reply.question_item_id)
+                        .collect::<Vec<_>>();
+                    let displayed_answer_changed =
+                        self.bottom_pane.question_editor().resolve_answers(&ids);
+                    if displayed_answer_changed && !self.bottom_pane.has_active_view() {
+                        self.bottom_pane.key_chord_reset_requested = true;
+                    }
+                    self.refresh_pending_input_preview();
+                    self.request_redraw();
+                }
                 self.on_committed_user_message(
                     &content,
                     client_id.as_deref(),
@@ -381,8 +413,8 @@ impl ChatWidget {
                         .unwrap_or(codex_app_server_protocol::WebSearchAction::Other),
                 );
             }
-            ThreadItem::ImageView { id: _, path } => {
-                self.on_view_image_tool_call(path);
+            ThreadItem::ImageView { id, path } => {
+                self.on_view_image_tool_call(id, path);
             }
             ThreadItem::ImageGeneration(item) => {
                 self.on_image_generation_end(
@@ -446,7 +478,7 @@ impl ChatWidget {
                 agents_states,
             }),
             item @ ThreadItem::SubAgentActivity { .. } => self.on_sub_agent_activity(item),
-            ThreadItem::DynamicToolCall { .. } => {}
+            item @ ThreadItem::DynamicToolCall { .. } => self.on_dynamic_tool_item(item),
             ThreadItem::Sleep(_) => {}
         }
 

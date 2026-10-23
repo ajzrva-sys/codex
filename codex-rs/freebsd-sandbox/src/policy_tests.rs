@@ -121,3 +121,58 @@ fn readable_symlink_grants_keep_the_logical_source_for_descriptor_validation() -
     );
     Ok(())
 }
+
+#[test]
+fn shared_client_managed_policy_preserves_grants_and_network() -> Result<()> {
+    use codex_freebsd_sandbox_client::policy as client;
+
+    let temporary = tempfile::tempdir()?;
+    let root = temporary.path().canonicalize()?;
+    let workspace = root.join("workspace");
+    let dependencies = root.join("dependencies");
+    let original = root.join("original");
+    for path in [&workspace, &dependencies, &original] {
+        std::fs::create_dir(path)?;
+    }
+    for network in [client::Network::Restricted, client::Network::Enabled] {
+        let policy = client::Policy {
+            grants: vec![
+                client::Grant {
+                    path: workspace.clone(),
+                    access: client::Access::Write,
+                },
+                client::Grant {
+                    path: dependencies.clone(),
+                    access: client::Access::Read,
+                },
+                client::Grant {
+                    path: original.clone(),
+                    access: client::Access::Deny,
+                },
+            ],
+            network,
+        };
+        let profile: PermissionProfile = serde_json::from_value(policy.permissions()?)?;
+        let plan = compile(&profile, &workspace)?;
+        let grants = [&workspace, &dependencies, &original]
+            .into_iter()
+            .map(|path| (path.clone(), plan.roots.get(path).copied()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            grants,
+            BTreeMap::from([
+                (workspace.clone(), Some(Access::Write)),
+                (dependencies.clone(), Some(Access::Read)),
+                (original.clone(), Some(Access::Deny)),
+            ])
+        );
+        assert_eq!(
+            plan.network,
+            match network {
+                client::Network::Restricted => NetworkSandboxPolicy::Restricted,
+                client::Network::Enabled => NetworkSandboxPolicy::Enabled,
+            }
+        );
+    }
+    Ok(())
+}

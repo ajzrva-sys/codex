@@ -119,7 +119,23 @@ impl TextArea {
         self.vim_commands.replace_steps.clear();
     }
 
-    pub(super) fn replace_vim_text(&mut self, text: &str) {
+    /// Remove a newly typed prompt marker without losing its Vim Replace recovery step.
+    pub(in crate::bottom_pane) fn absorb_prompt_prefix(&mut self, prefix_len: usize) {
+        if self.is_vim_replace_mode()
+            && self.cursor_pos == prefix_len
+            && let Some(step) = self.vim_commands.replace_steps.last_mut()
+            && step.cursor_before == 0
+            && step.start == 0
+            && step.inserted_len == prefix_len
+        {
+            step.inserted_len = 0;
+            self.replace_range_preserving_recovery(0..prefix_len, "");
+        } else {
+            self.replace_range(0..prefix_len, "");
+        }
+    }
+
+    pub(in crate::bottom_pane) fn replace_vim_text(&mut self, text: &str) {
         for grapheme in text.graphemes(/*is_extended*/ true) {
             let cursor_before = self.cursor_pos;
             while let Some(element) = self
@@ -224,16 +240,6 @@ impl TextArea {
     }
 
     pub(super) fn apply_vim_insert_action(&mut self, action: VimAction) -> bool {
-        let recording = self.vim_enabled
-            && matches!(self.vim_mode, VimMode::Insert | VimMode::Replace)
-            && !self.vim_commands.replaying
-            && !self.vim_commands.pending_change.is_empty();
-        let prior_len = self.text.len();
-        if !self.apply_vim_editor_action(action.clone()) {
-            return false;
-        }
-        let changed =
-            self.text.len() != prior_len || matches!(action, VimAction::RestoreReplacedCharacter);
         let deletion = matches!(
             action,
             VimAction::DeleteBackward
@@ -244,6 +250,26 @@ impl TextArea {
                 | VimAction::KillLine
                 | VimAction::KillLineEnd
         );
+        if deletion && let Some(range) = self.mouse_selection_range() {
+            self.vim_commands = VimCommandState::default();
+            if matches!(action, VimAction::DeleteBackward | VimAction::DeleteForward) {
+                self.replace_range(range, "");
+            } else {
+                self.kill_range(range);
+            }
+            return true;
+        }
+        self.mouse_selection = None;
+        let recording = self.vim_enabled
+            && matches!(self.vim_mode, VimMode::Insert | VimMode::Replace)
+            && !self.vim_commands.replaying
+            && !self.vim_commands.pending_change.is_empty();
+        let prior_len = self.text.len();
+        if !self.apply_vim_editor_action(action.clone()) {
+            return false;
+        }
+        let changed =
+            self.text.len() != prior_len || matches!(action, VimAction::RestoreReplacedCharacter);
         if recording && (changed || !deletion) {
             self.vim_commands
                 .pending_change
@@ -538,7 +564,9 @@ impl TextArea {
     pub(super) fn handle_vim_pending_command(&mut self, pending: VimPending, event: KeyEvent) {
         match pending {
             VimPending::Replace => {
-                if let Some(ch) = vim_command_char(event) {
+                if let Some(ch) = vim_command_char(event)
+                    && !(self.single_line && matches!(ch, '\r' | '\n'))
+                {
                     self.start_vim_edit(VimAction::Replace(ch));
                 }
             }

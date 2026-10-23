@@ -2,9 +2,15 @@ pub mod auth;
 pub mod auth_env_telemetry;
 pub mod test_support;
 pub mod token_data;
+pub use auth::WorkspaceRouting;
+pub use auth::WorkspaceRoutingRequest;
+pub use auth::WorkspaceRoutingResolver;
+pub use auth::WorkspaceRoutingSession;
 
 mod callback_params;
 mod device_code_auth;
+mod oauth;
+mod oauth_session;
 mod outbound_proxy;
 mod pkce;
 mod server;
@@ -26,6 +32,9 @@ pub use success_page::CODEX_OPEN_APP_URL;
 pub use success_page::LoginSuccessPage;
 pub use success_page::LoginSuccessPageBrand;
 
+pub use auth::AccountOAuthGrant;
+pub use auth::AccountOAuthGrantLease;
+pub use auth::AccountOAuthGrantRevision;
 pub use auth::AgentIdentityAuthPolicy;
 pub use auth::AuthChangeState;
 pub use auth::AuthConfig;
@@ -35,6 +44,7 @@ pub use auth::AuthKeyringBackendKind;
 pub use auth::AuthManager;
 pub use auth::AuthManagerConfig;
 pub use auth::AuthManagerInitializationError;
+pub use auth::AuthRuntimeConfig;
 pub use auth::CLIENT_ID;
 pub use auth::CLIENT_ID_OVERRIDE_ENV_VAR;
 pub use auth::CODEX_ACCESS_TOKEN_ENV_VAR;
@@ -67,3 +77,22 @@ pub use auth_env_telemetry::AuthEnvTelemetry;
 pub use auth_env_telemetry::collect_auth_env_telemetry;
 pub use outbound_proxy::AuthRouteConfig;
 pub use token_data::TokenData;
+
+// Existing inference-gateway names continue to refer to the same grant manager.
+pub use oauth_session::OAuthLoginControl as GatewayLoginControl;
+pub use oauth_session::OAuthSessionConfig as GatewayAuthConfig;
+pub use oauth_session::OAuthSessionError as GatewayAuthError;
+pub use oauth_session::OAuthSessionManager as GatewayAuthManager;
+pub use oauth_session::OAuthSessionStatus as GatewayAuthStatus;
+pub use oauth_session::OAuthSessionStatusChange as GatewayAuthStatusChange;
+pub use oauth_session::subscribe_oauth_session_status as subscribe_gateway_auth_status;
+
+pub use oauth_session::OAuthLoginControl;
+pub use oauth_session::OAuthRequestCredentials;
+pub use oauth_session::OAuthSessionConfig;
+pub use oauth_session::OAuthSessionError;
+pub use oauth_session::OAuthSessionManager;
+pub use oauth_session::OAuthSessionRequest;
+pub use oauth_session::OAuthSessionStatus;
+pub use oauth_session::OAuthSessionStatusChange;
+pub use oauth_session::subscribe_oauth_session_status;

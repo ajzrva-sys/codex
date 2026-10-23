@@ -15,6 +15,7 @@ use crate::temporary_structured_request::start_temporary_thread;
 use crate::temporary_structured_request::unsubscribe_temporary_thread;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadItem;
+use codex_app_server_protocol::ThreadSource;
 use codex_app_server_protocol::UserInput;
 use codex_protocol::ThreadId;
 use codex_protocol::models::MessagePhase;
@@ -37,23 +38,12 @@ struct GeneratedThreadTitle {
 }
 
 impl App {
-    pub(super) fn sync_thread_title_progress(&mut self) {
-        let pending = self.chat_widget.thread_id().is_some_and(|thread_id| {
-            self.pending_thread_titles
-                .keys()
-                .any(|(id, _)| *id == thread_id)
-        });
-        self.chat_widget
-            .set_thread_title_generation_pending(pending);
-    }
-
     pub(super) fn finish_thread_title_generation(
         &mut self,
         thread_id: ThreadId,
         destination: ThreadTitleDestination,
     ) {
         self.pending_thread_titles.remove(&(thread_id, destination));
-        self.sync_thread_title_progress();
     }
 
     /// A saved manual name supersedes any pending title generation for that thread.
@@ -66,7 +56,6 @@ impl App {
                 true
             }
         });
-        self.sync_thread_title_progress();
     }
 
     /// Start a hidden title-generation thread without blocking the UI loop.
@@ -83,7 +72,6 @@ impl App {
             return;
         };
         let cancellation = entry.insert(CancellationToken::new()).clone();
-        self.sync_thread_title_progress();
         let request_handle = app_server.request_handle();
         let model = if self.chat_widget.config_ref().model_provider_id == "openai"
             && self.chat_widget.has_chatgpt_account()
@@ -100,6 +88,7 @@ impl App {
         let effort = (model == THREAD_TITLE_MODEL).then_some(ReasoningEffort::Low);
         let config = self.chat_widget.config_ref();
         let options = TemporaryStructuredThreadOptions {
+            thread_source: ThreadSource::Feature("thread_title".to_string()),
             model,
             model_provider: config.model_provider_id.clone(),
             cwd: config.cwd.display().to_string(),
@@ -316,7 +305,7 @@ where
                     .iter()
                     .filter_map(|input| match input {
                         UserInput::Text { text, .. } => {
-                            Some(crate::ide_context::extract_prompt_request_with_offset(text).0)
+                            Some(crate::user_prompt::extract_prompt_request_with_offset(text).0)
                         }
                         _ => None,
                     })

@@ -34,6 +34,7 @@ use codex_app_server_protocol::CyberAccessProgram;
 use codex_app_server_protocol::FileChangeApprovalDecision;
 use codex_app_server_protocol::FileChangePatchUpdatedNotification;
 use codex_app_server_protocol::FileChangeRequestApprovalResponse;
+use codex_app_server_protocol::ImageReference as V2ImageReference;
 use codex_app_server_protocol::ItemCompletedNotification;
 use codex_app_server_protocol::ItemStartedNotification;
 use codex_app_server_protocol::JSONRPCError;
@@ -77,7 +78,6 @@ use codex_core::test_support::all_model_presets;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
 use codex_features::Feature;
 use codex_login::AuthCredentialsStoreMode;
-use codex_models_manager::model_info::BASE_INSTRUCTIONS;
 use codex_models_manager::model_info::model_info_from_slug;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
@@ -267,7 +267,15 @@ async fn turn_start_omits_notification_media_without_changing_model_input() -> R
                         text_elements: Vec::new(),
                     },
                     V2UserInput::Image {
-                        url: TINY_PNG_DATA_URL.to_string(),
+                        image: V2ImageReference::Inline {
+                            url: TINY_PNG_DATA_URL.to_string(),
+                        },
+                        detail: None,
+                    },
+                    V2UserInput::Image {
+                        image: V2ImageReference::File {
+                            file_id: "file_123".to_string(),
+                        },
                         detail: None,
                     },
                 ],
@@ -315,6 +323,8 @@ async fn turn_start_omits_notification_media_without_changing_model_input() -> R
                     content[0]["type"].as_str(),
                     Some("text" | "input_text")
                 ));
+                assert!(content[0].get("fileId").is_none());
+                assert!(content[0].get("file_id").is_none());
                 user_message_notifications.push(notification.method);
             }
         }
@@ -332,14 +342,28 @@ async fn turn_start_omits_notification_media_without_changing_model_input() -> R
     );
 
     let model_input_images = received_response_input_images(&server).await?;
-    assert_eq!(model_input_images.len(), 1);
-    assert_eq!(model_input_images[0]["image_url"], TINY_PNG_DATA_URL);
+    assert_eq!(model_input_images.len(), 2);
+    assert!(
+        model_input_images
+            .iter()
+            .any(|image| image["image_url"] == TINY_PNG_DATA_URL)
+    );
+    assert!(
+        model_input_images
+            .iter()
+            .any(|image| image["file_id"] == "file_123")
+    );
 
     Ok(())
 }
 
+#[test_case(None; "analytics_unset")]
+#[test_case(Some(true); "analytics_enabled")]
+#[test_case(Some(false); "analytics_disabled")]
 #[tokio::test]
-async fn tool_call_metadata_stays_out_of_raw_response_item_notifications() -> Result<()> {
+async fn tool_call_metadata_stays_out_of_raw_response_item_notifications(
+    analytics_enabled: Option<bool>,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let arguments = json!({"query": "redaction"});
@@ -372,7 +396,8 @@ async fn tool_call_metadata_stays_out_of_raw_response_item_notifications() -> Re
             "params": {"name": "calendar_list_events", "arguments": arguments},
         })))
         .respond_with(move |request: &Request| {
-            let request: Value = serde_json::from_slice(&request.body).unwrap();
+            let request: Value =
+                serde_json::from_slice(&request.body).expect("valid MCP tool call JSON");
             ResponseTemplate::new(200).set_body_json(json!({
                 "jsonrpc": "2.0",
                 "id": request["id"],
@@ -384,7 +409,7 @@ async fn tool_call_metadata_stays_out_of_raw_response_item_notifications() -> Re
         .mount(&server)
         .await;
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri())
+    let mut config = MockResponsesConfig::new(&server.uri())
         .with_provider_name("OpenAI")
         .with_provider_config("supports_websockets = false")
         .with_root_config(&format!(
@@ -392,8 +417,11 @@ async fn tool_call_metadata_stays_out_of_raw_response_item_notifications() -> Re
             apps.chatgpt_base_url
         ))
         .enable_feature(Feature::Apps)
-        .enable_feature(Feature::ExecutedToolCallMetadata)
-        .write(codex_home.path())?;
+        .enable_feature(Feature::ExecutedToolCallMetadata);
+    if let Some(enabled) = analytics_enabled {
+        config = config.with_extra_config(&format!("[analytics]\nenabled = {enabled}"));
+    }
+    config.write(codex_home.path())?;
     write_chatgpt_auth(
         codex_home.path(),
         ChatGptAuthFixture::new("chatgpt-test-token")
@@ -510,11 +538,10 @@ async fn tool_call_metadata_stays_out_of_raw_response_item_notifications() -> Re
         .context("persisted MCP output")?;
     assert_eq!(captured["output"], raw_output["output"]);
     // The custom inference endpoint omits raw metadata, so verify capture in the rollout.
-    let expected_metadata: Option<&Value> = None;
     assert_eq!(
         captured["internal_chat_message_metadata_passthrough"]["executed_tool_calls"][0]
             .get("tool_result_metadata"),
-        expected_metadata,
+        (analytics_enabled != Some(false)).then_some(&result_metadata),
     );
     Ok(())
 }
@@ -556,11 +583,13 @@ async fn turn_start_with_empty_input_runs_model_request() -> Result<()> {
         })
         .await?;
     assert!(!turn.id.is_empty());
+    assert_eq!(turn.root_turn_id.as_deref(), Some(turn.id.as_str()));
 
     let started: TurnStartedNotification =
         timeout(DEFAULT_READ_TIMEOUT, mcp.read_notification("turn/started")).await??;
     assert_eq!(started.thread_id, thread.id);
     assert_eq!(started.turn.id, turn.id);
+    assert_eq!(started.turn.root_turn_id.as_deref(), Some(turn.id.as_str()));
     assert_eq!(started.turn.status, TurnStatus::InProgress);
 
     let completed: TurnCompletedNotification = timeout(
@@ -570,6 +599,10 @@ async fn turn_start_with_empty_input_runs_model_request() -> Result<()> {
     .await??;
     assert_eq!(completed.thread_id, thread.id);
     assert_eq!(completed.turn.id, turn.id);
+    assert_eq!(
+        completed.turn.root_turn_id.as_deref(),
+        Some(turn.id.as_str())
+    );
     assert_eq!(completed.turn.status, TurnStatus::Completed);
     assert_eq!(completed.turn.items_view, TurnItemsView::Summary);
     assert!(matches!(
@@ -675,17 +708,18 @@ async fn turn_start_steers_active_turn_and_returns_active_turn_id() -> Result<()
                     text: "start".to_string(),
                     text_elements: Vec::new(),
                 }],
-                turn_trigger: Some("user".to_string()),
+                turn_trigger: Some("goal".to_string()),
+                parent_turn_id: Some("initiating-turn".to_string()),
+                root_turn_id: Some("causal-root".to_string()),
                 cyber_access_program: Some(CyberAccessProgram::DaybreakBlue),
                 ..Default::default()
             },
         })
         .await?;
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("turn/started"),
-    )
-    .await??;
+    let started: TurnStartedNotification =
+        timeout(DEFAULT_READ_TIMEOUT, mcp.read_notification("turn/started")).await??;
+    assert_eq!(active_turn.root_turn_id.as_deref(), Some("causal-root"));
+    assert_eq!(started.turn.root_turn_id.as_deref(), Some("causal-root"));
     timeout(
         DEFAULT_READ_TIMEOUT,
         server.wait_for_request_count(/*count*/ 1),
@@ -718,22 +752,26 @@ async fn turn_start_steers_active_turn_and_returns_active_turn_id() -> Result<()
                     text: "steer".to_string(),
                     text_elements: Vec::new(),
                 }],
-                turn_trigger: Some("goal".to_string()),
+                turn_trigger: Some("user".to_string()),
+                parent_turn_id: Some("steering-turn".to_string()),
+                root_turn_id: Some("steering-root".to_string()),
                 cyber_access_program: Some(CyberAccessProgram::Standard),
                 ..Default::default()
             },
         })
         .await?;
     assert_eq!(steered_turn.id, active_turn.id);
+    assert_eq!(steered_turn.root_turn_id, active_turn.root_turn_id);
 
     release_response
         .send(())
         .expect("active response gate should remain open");
-    timeout(
+    let completed: TurnCompletedNotification = timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("turn/completed"),
+        mcp.read_notification("turn/completed"),
     )
     .await??;
+    assert_eq!(completed.turn.root_turn_id.as_deref(), Some("causal-root"));
 
     let requests = server.requests().await;
     assert_eq!(requests.len(), 2);
@@ -745,7 +783,9 @@ async fn turn_start_steers_active_turn_and_returns_active_turn_id() -> Result<()
                 .as_str()
                 .context("expected x-codex-turn-metadata")?,
         )?;
-        assert_eq!(turn_metadata["turn_trigger"].as_str(), Some("user"));
+        assert_eq!(turn_metadata["turn_trigger"].as_str(), Some("goal"));
+        assert_eq!(turn_metadata["parent_turn_id"], "initiating-turn");
+        assert_eq!(turn_metadata["root_turn_id"], "causal-root");
     }
     Ok(())
 }
@@ -816,15 +856,17 @@ async fn turn_start_additional_context_flows_to_model_input() -> Result<()> {
     Ok(())
 }
 
+#[test_case::test_case(None, TEST_ORIGINATOR)]
 #[tokio::test]
-async fn turn_start_sends_originator_header() -> Result<()> {
+async fn turn_start_sends_originator_header(
+    service_name: Option<&str>,
+    expected_originator: &str,
+) -> Result<()> {
     let responses = vec![create_final_assistant_message_sse_response("Done")?];
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
 
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri())
-        .enable_feature(Feature::Personality)
-        .write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -844,6 +886,7 @@ async fn turn_start_sends_originator_header() -> Result<()> {
         .start_thread(ThreadStartParams {
             model: Some("mock-model".to_string()),
             thread_source: Some(ThreadSource::User),
+            service_name: service_name.map(str::to_string),
             ..Default::default()
         })
         .await?;
@@ -879,7 +922,7 @@ async fn turn_start_sends_originator_header() -> Result<()> {
             .headers
             .get("originator")
             .expect("originator header missing");
-        assert_eq!(originator.to_str()?, TEST_ORIGINATOR);
+        assert_eq!(originator.to_str()?, expected_originator);
     }
 
     Ok(())
@@ -891,9 +934,7 @@ async fn turn_start_emits_user_message_item_with_text_elements() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
 
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri())
-        .enable_feature(Feature::Personality)
-        .write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -969,9 +1010,7 @@ async fn turn_start_emits_thread_scoped_warning_notification_for_trimmed_skills(
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
 
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri())
-        .enable_feature(Feature::Personality)
-        .write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
     write_models_cache(codex_home.path()).await?;
     let cache_path = codex_home.path().join("models_cache.json");
     let mut cache: serde_json::Value =
@@ -1029,7 +1068,7 @@ async fn turn_start_emits_thread_scoped_warning_notification_for_trimmed_skills(
     assert_eq!(warning.thread_id.as_deref(), Some(thread.id.as_str()));
     assert_eq!(
         warning.message,
-        "Exceeded skills context budget. All skill descriptions were removed and 7 additional skills were not included in the model-visible skills list."
+        "Exceeded skills context budget. All skill descriptions were removed and 6 additional skills were not included in the model-visible skills list."
     );
 
     timeout(
@@ -1393,7 +1432,9 @@ async fn turn_start_tracks_thread_originator_in_analytics() -> Result<()> {
                 thread_id: thread.id.clone(),
                 client_user_message_id: None,
                 input: vec![V2UserInput::Image {
-                    url: TINY_PNG_DATA_URL.to_string(),
+                    image: V2ImageReference::Inline {
+                        url: TINY_PNG_DATA_URL.to_string(),
+                    },
                     detail: None,
                 }],
                 turn_trigger: Some("user".to_string()),
@@ -1804,9 +1845,7 @@ async fn turn_start_accepts_text_at_limit_with_mention_item() -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
 
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri())
-        .enable_feature(Feature::Personality)
-        .write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -1854,9 +1893,7 @@ async fn turn_start_accepts_text_at_limit_with_mention_item() -> Result<()> {
 #[tokio::test]
 async fn turn_start_rejects_combined_oversized_text_input() -> Result<()> {
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new("http://localhost/unused")
-        .enable_feature(Feature::Personality)
-        .write(codex_home.path())?;
+    MockResponsesConfig::new("http://localhost/unused").write(codex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -1947,9 +1984,7 @@ async fn turn_start_rejects_combined_oversized_text_input() -> Result<()> {
 #[tokio::test]
 async fn turn_start_rejects_invalid_permission_selection_before_starting_turn() -> Result<()> {
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new("http://localhost/unused")
-        .enable_feature(Feature::Personality)
-        .write(codex_home.path())?;
+    MockResponsesConfig::new("http://localhost/unused").write(codex_home.path())?;
     std::fs::write(
         codex_home.path().join("managed_config.toml"),
         "sandbox_mode = \"read-only\"\n",
@@ -2381,9 +2416,7 @@ async fn turn_start_emits_notifications_and_accepts_model_override() -> Result<(
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
 
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri())
-        .enable_feature(Feature::Personality)
-        .write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -2623,95 +2656,6 @@ async fn turn_start_uses_thread_feature_overrides_for_request_user_input_tool_de
     Ok(())
 }
 
-fn assert_fallback_model_instructions(request: &responses::ResponsesRequest) {
-    let instructions = request.instructions_text();
-    let expected_intro = BASE_INSTRUCTIONS
-        .lines()
-        .next()
-        .expect("fallback prompt has an opening sentence");
-    let expected_personality = BASE_INSTRUCTIONS
-        .lines()
-        .find(|line| line.starts_with("Your default personality and tone"))
-        .expect("fallback prompt has a Friendly personality section");
-
-    assert!(
-        instructions.contains(expected_intro),
-        "expected fallback model identity instructions in the request"
-    );
-    assert!(
-        instructions.contains(expected_personality),
-        "expected baked Friendly instructions in the request"
-    );
-}
-
-#[tokio::test]
-async fn turn_start_accepts_deprecated_personality_override_v2() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = responses::start_mock_server().await;
-    let body = responses::sse(vec![
-        responses::ev_response_created("resp-1"),
-        responses::ev_assistant_message("msg-1", "Done"),
-        responses::ev_completed("resp-1"),
-    ]);
-    let response_mock = responses::mount_sse_once(&server, body).await;
-
-    let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri())
-        .enable_feature(Feature::Personality)
-        .write(codex_home.path())?;
-
-    let mut mcp = TestAppServer::builder()
-        .with_codex_home(codex_home.path())
-        .build_initialized()
-        .await?;
-
-    let ThreadStartResponse { thread, .. } = mcp
-        .start_thread(ThreadStartParams {
-            model: Some("exp-codex-personality".to_string()),
-            ..Default::default()
-        })
-        .await?;
-
-    let _turn: TurnStartResponse = mcp
-        .request(|request_id| ClientRequest::TurnStart {
-            request_id,
-            params: TurnStartParams {
-                thread_id: thread.id.clone(),
-                client_user_message_id: None,
-                input: vec![V2UserInput::Text {
-                    text: "Hello".to_string(),
-                    text_elements: Vec::new(),
-                }],
-                personality: Some(Personality::Friendly),
-                ..Default::default()
-            },
-        })
-        .await?;
-
-    timeout(
-        DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_notification_message("turn/completed"),
-    )
-    .await??;
-
-    let request = response_mock.single_request();
-    assert_fallback_model_instructions(&request);
-    let developer_texts = request.message_input_texts("developer");
-    if developer_texts.is_empty() {
-        eprintln!("request body: {}", request.body_json());
-    }
-
-    assert!(
-        developer_texts
-            .iter()
-            .all(|text| !text.contains("<personality_spec>")),
-        "deprecated personality override emitted a developer update: {developer_texts:?}"
-    );
-
-    Ok(())
-}
-
 #[tokio::test]
 async fn turn_start_ignores_deprecated_multi_agent_mode() -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -2852,8 +2796,14 @@ async fn thread_start_ignores_deprecated_multi_agent_mode() -> Result<()> {
     Ok(())
 }
 
+#[test_case(Personality::Pragmatic, Personality::Friendly; "friendly")]
+#[test_case(Personality::Friendly, Personality::Pragmatic; "pragmatic")]
+#[test_case(Personality::Friendly, Personality::None; "none")]
 #[tokio::test]
-async fn turn_start_ignores_personality_change_mid_thread_v2() -> Result<()> {
+async fn turn_start_reports_personality_overrides_v2(
+    first_personality: Personality,
+    next_personality: Personality,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = responses::start_mock_server().await;
@@ -2870,9 +2820,7 @@ async fn turn_start_ignores_personality_change_mid_thread_v2() -> Result<()> {
     let response_mock = responses::mount_sse_sequence(&server, vec![sse1, sse2]).await;
 
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri())
-        .enable_feature(Feature::Personality)
-        .write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -2896,7 +2844,7 @@ async fn turn_start_ignores_personality_change_mid_thread_v2() -> Result<()> {
                     text: "Hello".to_string(),
                     text_elements: Vec::new(),
                 }],
-                personality: None,
+                personality: Some(first_personality),
                 ..Default::default()
             },
         })
@@ -2907,6 +2855,7 @@ async fn turn_start_ignores_personality_change_mid_thread_v2() -> Result<()> {
         mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+    mcp.clear_message_buffer();
 
     let _turn2: TurnStartResponse = mcp
         .request(|request_id| ClientRequest::TurnStart {
@@ -2918,11 +2867,21 @@ async fn turn_start_ignores_personality_change_mid_thread_v2() -> Result<()> {
                     text: "Hello again".to_string(),
                     text_elements: Vec::new(),
                 }],
-                personality: Some(Personality::Friendly),
+                personality: Some(next_personality),
                 ..Default::default()
             },
         })
         .await?;
+
+    let settings_updated: ThreadSettingsUpdatedNotification = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_notification("thread/settings/updated"),
+    )
+    .await??;
+    assert_eq!(
+        settings_updated.thread_settings.personality,
+        Some(next_personality)
+    );
 
     timeout(
         DEFAULT_READ_TIMEOUT,
@@ -2933,22 +2892,10 @@ async fn turn_start_ignores_personality_change_mid_thread_v2() -> Result<()> {
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 2, "expected two requests");
 
-    let first_developer_texts = requests[0].message_input_texts("developer");
-    assert_fallback_model_instructions(&requests[0]);
-    assert!(
-        first_developer_texts
-            .iter()
-            .all(|text| !text.contains("<personality_spec>")),
-        "expected no personality update message in first request, got {first_developer_texts:?}"
-    );
-
-    let second_developer_texts = requests[1].message_input_texts("developer");
-    assert_fallback_model_instructions(&requests[1]);
-    assert!(
-        second_developer_texts
-            .iter()
-            .all(|text| !text.contains("<personality_spec>")),
-        "deprecated personality change emitted a developer update: {second_developer_texts:?}"
+    assert_eq!(
+        requests[1].instructions_text(),
+        requests[0].instructions_text(),
+        "turn updates preserve the original base instructions"
     );
 
     Ok(())
@@ -3455,8 +3402,11 @@ async fn turn_start_explicit_local_environment_updates_legacy_cwd_between_turns(
                     text_elements: Vec::new(),
                 }],
                 turn_trigger: None,
+                parent_turn_id: None,
+                root_turn_id: None,
                 tool_output: None,
                 responsesapi_client_metadata: None,
+                responsesapi_client_metadata_patch: None,
                 additional_context: None,
                 cwd: Some(first_cwd.clone()),
                 runtime_workspace_roots: None,
@@ -3508,8 +3458,11 @@ async fn turn_start_explicit_local_environment_updates_legacy_cwd_between_turns(
                     text_elements: Vec::new(),
                 }],
                 turn_trigger: None,
+                parent_turn_id: None,
+                root_turn_id: None,
                 tool_output: None,
                 responsesapi_client_metadata: None,
+                responsesapi_client_metadata_patch: None,
                 additional_context: None,
                 cwd: None,
                 runtime_workspace_roots: None,
@@ -4645,6 +4598,7 @@ async fn direct_input_to_multi_agent_v2_subagent_is_rejected(
         .request(|request_id| ClientRequest::ThreadList {
             request_id,
             params: codex_app_server_protocol::ThreadListParams {
+                excluded_thread_ids: None,
                 originators: None,
                 cursor: None,
                 limit: Some(10),
@@ -4730,6 +4684,7 @@ async fn direct_input_to_multi_agent_v2_subagent_is_rejected(
                 text_elements: Vec::new(),
             }],
             responsesapi_client_metadata: None,
+            responsesapi_client_metadata_patch: None,
             additional_context: None,
             expected_turn_id: "any-active-turn".to_string(),
         })
@@ -5483,9 +5438,13 @@ async fn run_turn_start_file_change_approval_rejection_v2(
     Ok(())
 }
 
+#[cfg_attr(not(windows), test_case(None; "started"))]
+#[test_case(Some(json!({"cmd": "echo unreachable", "workdir": "missing-work-directory", "tty": false})); "pipe_launch_failure")]
+#[test_case(Some(json!({"cmd": "echo unreachable\u{0}", "tty": true, "login": false})); "pty_launch_failure")]
 #[tokio::test]
-#[cfg_attr(windows, ignore = "process id reporting differs on Windows")]
-async fn command_execution_notifications_include_process_id() -> Result<()> {
+async fn command_execution_notifications_include_process_id(
+    launch_failure_args: Option<Value>,
+) -> Result<()> {
     // TODO(anp): Add target-Windows process-id expectations for remote executors.
     skip_if_wine_exec!(
         Ok(()),
@@ -5493,8 +5452,18 @@ async fn command_execution_notifications_include_process_id() -> Result<()> {
     );
     skip_if_no_network!(Ok(()));
 
+    let launch_failed = launch_failure_args.is_some();
+    let command = if let Some(args) = launch_failure_args {
+        responses::sse(vec![
+            responses::ev_response_created("launch"),
+            responses::ev_function_call("uexec-1", "exec_command", &args.to_string()),
+            responses::ev_completed("launch"),
+        ])
+    } else {
+        create_exec_command_sse_response("uexec-1")?
+    };
     let responses = vec![
-        create_exec_command_sse_response("uexec-1")?,
+        command,
         create_final_assistant_message_sse_response("done")?,
     ];
     let server = create_mock_responses_server_sequence(responses).await;
@@ -5502,6 +5471,7 @@ async fn command_execution_notifications_include_process_id() -> Result<()> {
     MockResponsesConfig::new(&server.uri())
         .with_sandbox_mode("danger-full-access")
         .enable_feature(Feature::UnifiedExec)
+        .disable_feature(Feature::ShellSnapshot)
         .write(codex_home.path())?;
 
     let mut mcp = TestAppServer::builder()
@@ -5552,7 +5522,7 @@ async fn command_execution_notifications_include_process_id() -> Result<()> {
     };
     assert_eq!(id, "uexec-1");
     assert_eq!(status, CommandExecutionStatus::InProgress);
-    let started_process_id = started_process_id.expect("process id should be present");
+    assert_eq!(started_process_id.is_none(), launch_failed);
 
     let completed_command = timeout(DEFAULT_READ_TIMEOUT, async {
         loop {
@@ -5569,6 +5539,8 @@ async fn command_execution_notifications_include_process_id() -> Result<()> {
         process_id: completed_process_id,
         status: completed_status,
         exit_code,
+        duration_ms,
+        aggregated_output,
         ..
     } = completed_command
     else {
@@ -5582,15 +5554,22 @@ async fn command_execution_notifications_include_process_id() -> Result<()> {
         ),
         "unexpected command execution status: {completed_status:?}"
     );
-    if completed_status == CommandExecutionStatus::Completed {
+    if launch_failed {
+        assert_eq!(
+            (completed_status, exit_code, duration_ms),
+            (CommandExecutionStatus::Failed, Some(-1), Some(0))
+        );
+        assert!(
+            aggregated_output
+                .context("launch diagnostic")?
+                .starts_with("Failed to create unified exec process:")
+        );
+    } else if completed_status == CommandExecutionStatus::Completed {
         assert_eq!(exit_code, Some(0));
     } else {
         assert!(exit_code.is_some(), "expected exit_code for failed command");
     }
-    assert_eq!(
-        completed_process_id.as_deref(),
-        Some(started_process_id.as_str())
-    );
+    assert_eq!(completed_process_id, started_process_id);
 
     timeout(
         DEFAULT_READ_TIMEOUT,
@@ -5598,16 +5577,30 @@ async fn command_execution_notifications_include_process_id() -> Result<()> {
     )
     .await??;
 
+    for method in mcp.pending_notification_methods() {
+        let notification = mcp.read_stream_until_notification_message(&method).await?;
+        assert_ne!(
+            notification.params.context("notification params")?["item"]["id"],
+            "uexec-1"
+        );
+    }
+
     Ok(())
 }
 
 #[cfg_attr(windows, ignore = "plugin attribution fixture is Unix-only")]
+#[test_case(CommandExecutionStatus::Completed; "completed")]
+#[test_case(CommandExecutionStatus::Failed; "launch_failure")]
 #[tokio::test]
-async fn command_execution_notifications_include_trusted_plugin_id() -> Result<()> {
+async fn command_execution_notifications_include_trusted_plugin_id(
+    expected_status: CommandExecutionStatus,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
     skip_if_wine_exec!(Ok(()), "plugin attribution fixture is Unix-only");
 
     let codex_home = TempDir::new()?;
+    let missing_cwd = codex_home.path().join("missing-work-directory");
+    let launch_failed = expected_status == CommandExecutionStatus::Failed;
     let curated_sha = "0123456789abcdef0123456789abcdef01234567";
     let plugin_root = codex_home
         .path()
@@ -5649,7 +5642,7 @@ async fn command_execution_notifications_include_trusted_plugin_id() -> Result<(
                 "/bin/sh".to_string(),
                 script_path.to_string_lossy().into_owned(),
             ],
-            /*workdir*/ None,
+            launch_failed.then_some(missing_cwd.as_path()),
             /*timeout_ms*/ None,
             "plugin-command",
         )?,
@@ -5660,7 +5653,9 @@ async fn command_execution_notifications_include_trusted_plugin_id() -> Result<(
         .with_approval_policy("on-request")
         .with_sandbox_mode("danger-full-access")
         .enable_feature(Feature::Plugins)
+        .enable_feature(Feature::UnifiedExec)
         .disable_feature(Feature::RemotePlugin)
+        .disable_feature(Feature::ShellSnapshot)
         .with_extra_config("[plugins.\"google-calendar@openai-api-curated\"]\nenabled = true")
         .write(codex_home.path())?;
 
@@ -5721,7 +5716,7 @@ async fn command_execution_notifications_include_trusted_plugin_id() -> Result<(
         if method == "item/started" {
             assert_eq!(status, CommandExecutionStatus::InProgress);
         } else {
-            assert_eq!(status, CommandExecutionStatus::Completed);
+            assert_eq!(status, expected_status);
         }
     }
 
@@ -5740,9 +5735,7 @@ async fn turn_start_with_elevated_override_does_not_persist_project_trust() -> R
     let server = create_mock_responses_server_sequence_unchecked(responses).await;
 
     let codex_home = TempDir::new()?;
-    MockResponsesConfig::new(&server.uri())
-        .enable_feature(Feature::Personality)
-        .write(codex_home.path())?;
+    MockResponsesConfig::new(&server.uri()).write(codex_home.path())?;
 
     let workspace = TempDir::new()?;
 

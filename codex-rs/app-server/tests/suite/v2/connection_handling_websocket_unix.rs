@@ -64,7 +64,10 @@ async fn websocket_transport_ctrl_c_waits_for_running_turn_before_exit() -> Resu
     send_turn_start_request(&mut ws, /*id*/ 4, &thread_id).await?;
     let rejected = read_error_for_id(&mut ws, /*id*/ 4).await?;
     assert_eq!(rejected.error.code, -32600);
-    assert_eq!(rejected.error.data, None);
+    assert_eq!(
+        rejected.error.data,
+        Some(json!({ "reason": "serverShuttingDown" }))
+    );
 
     send_request(
         &mut ws,
@@ -242,14 +245,44 @@ async fn websocket_transport_repeated_sighup_keeps_waiting_for_running_turn() ->
 #[cfg(unix)]
 #[tokio::test]
 async fn websocket_transport_allows_turn_interrupt_during_drain() -> Result<()> {
-    let GracefulCtrlCFixture {
-        _codex_home,
-        _server,
-        mut process,
-        mut ws,
-        thread_id,
-        turn_id,
-    } = start_ctrl_c_restart_fixture(Duration::from_secs(3)).await?;
+    let (_release_target, target_gate) = oneshot::channel();
+    let (release_guard, guard_gate) = oneshot::channel();
+    let (server, _completions) = start_streaming_sse_server(vec![
+        vec![StreamingSseChunk {
+            gate: Some(target_gate),
+            body: create_final_assistant_message_sse_response("Done")?,
+        }],
+        vec![StreamingSseChunk {
+            gate: Some(guard_gate),
+            body: create_final_assistant_message_sse_response("Guard done")?,
+        }],
+    ])
+    .await;
+    let (_codex_home, mut process, mut ws) = start_ctrl_c_restart_client(server.uri()).await?;
+    send_thread_start_request(&mut ws, /*id*/ 2).await?;
+    let ThreadStartResponse { thread, .. } =
+        to_response(read_response_for_id(&mut ws, /*id*/ 2).await?)?;
+    let thread_id = thread.id;
+    send_turn_start_request(&mut ws, /*id*/ 3, &thread_id).await?;
+    let TurnStartResponse { turn } = to_response(read_response_for_id(&mut ws, /*id*/ 3).await?)?;
+    let turn_id = turn.id;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        server.wait_for_request_count(/*count*/ 1),
+    )
+    .await?;
+
+    // Keep another turn active so shutdown cannot race the interrupt reply.
+    send_thread_start_request(&mut ws, /*id*/ 10).await?;
+    let ThreadStartResponse { thread, .. } =
+        to_response(read_response_for_id(&mut ws, /*id*/ 10).await?)?;
+    send_turn_start_request(&mut ws, /*id*/ 11, &thread.id).await?;
+    read_response_for_id(&mut ws, /*id*/ 11).await?;
+    timeout(
+        DEFAULT_READ_TIMEOUT,
+        server.wait_for_request_count(/*count*/ 2),
+    )
+    .await?;
 
     send_sigint(&process)?;
     assert_process_does_not_exit_within(&mut process, Duration::from_millis(300)).await?;
@@ -266,6 +299,7 @@ async fn websocket_transport_allows_turn_interrupt_during_drain() -> Result<()> 
     )
     .await?;
     read_response_for_id(&mut ws, /*id*/ 4).await?;
+    release_guard.send(()).expect("guard response is waiting");
     let status = wait_for_process_exit_within(
         &mut process,
         Duration::from_secs(10),

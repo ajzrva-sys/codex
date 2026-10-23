@@ -17,7 +17,7 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::Threading::OpenProcessToken;
 
 fn current_process_token() -> Result<OwnedHandle> {
-    let mut raw = 0;
+    let mut raw = std::ptr::null_mut();
     ensure!(
         unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw) } != 0,
         "open current-process token: {}",
@@ -34,6 +34,7 @@ fn matches_only_the_complete_retained_authentication_id() {
             LowPart: 17,
             HighPart: 4,
         }],
+        sids: Vec::new(),
     };
     let observed = [
         LUID {
@@ -102,5 +103,7 @@ fn retained_token_remains_queryable_after_the_borrowed_handle_is_closed() -> Res
     assert_eq!(retained._tokens.len(), 1);
     let actual_sid = unsafe { get_user_sid_bytes(retained._tokens[0].as_raw_handle() as HANDLE) }?;
     assert_eq!(actual_sid, expected_sid);
+    assert!(retained.contains_sid(&expected_sid));
+    assert!(!retained.contains_sid(&[]));
     Ok(())
 }

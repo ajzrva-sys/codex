@@ -5,6 +5,51 @@ use crate::app_event::AppEvent;
 use crate::chatwidget::rate_limits::RATE_LIMIT_SWITCH_PROMPT_VIEW_ID;
 
 impl ChatWidget {
+    pub(crate) fn set_daybreak_enabled(&mut self, enabled: bool) {
+        self.daybreak_enabled = enabled && self.daybreak_feature_enabled();
+        self.bottom_pane
+            .set_daybreak_command_description(self.daybreak_command_description());
+    }
+
+    fn daybreak_feature_enabled(&self) -> bool {
+        // Preserve a resumed preference while account state is still unknown. Once an API-key
+        // account is known, both flags must be enabled before using that preference.
+        self.config.features.enabled(Feature::CliDaybreak)
+            && (self.has_chatgpt_account
+                || !matches!(
+                    self.status_account_display,
+                    Some(StatusAccountDisplay::ApiKey)
+                )
+                || self
+                    .config
+                    .features
+                    .enabled(Feature::ApiKeyCyberAccessPrograms))
+    }
+
+    /// UI and turn-selection eligibility; the catalog and server still determine program access.
+    pub(crate) fn daybreak_account_eligible(&self) -> bool {
+        self.daybreak_feature_enabled()
+            && self.config.model_provider_id == "openai"
+            && (self.has_chatgpt_account
+                || matches!(
+                    self.status_account_display,
+                    Some(StatusAccountDisplay::ApiKey)
+                ))
+    }
+
+    pub(super) fn daybreak_command_description(&self) -> Option<&'static str> {
+        if self.daybreak_enabled {
+            Some("Disable broader access for cybersecurity work")
+        } else if !self.daybreak_account_eligible() {
+            None
+        } else {
+            match crate::daybreak::availability(&self.model_catalog.models) {
+                Some(true) => Some("Enable broader access for cybersecurity work"),
+                Some(false) => Some("Learn about broader access for cybersecurity work"),
+                None => Some("Manage broader access for cybersecurity work"),
+            }
+        }
+    }
     /// Set the approval policy in the widget's config copy.
     pub(crate) fn set_approval_policy(&mut self, policy: AskForApproval) {
         if let Err(err) = self
@@ -31,6 +76,7 @@ impl ChatWidget {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn set_permission_profile_with_active_profile(
         &mut self,
         profile: PermissionProfile,
@@ -56,14 +102,14 @@ impl ChatWidget {
     }
 
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    pub(crate) fn set_windows_sandbox_mode(&mut self, mode: Option<WindowsSandboxModeToml>) {
-        self.config.permissions.windows_sandbox_mode = mode;
+    pub(crate) fn set_windows_sandbox_mode(&mut self, mode: Option<WindowsSandboxSetupMode>) {
+        self.windows_sandbox_config.mode = mode;
         #[cfg(target_os = "windows")]
-        self.bottom_pane
-            .set_windows_degraded_sandbox_active(matches!(
-                crate::windows_sandbox::level_from_config(&self.config),
-                WindowsSandboxLevel::RestrictedToken
-            ));
+        {
+            let enabled = self.builtin_command_flags().allow_elevate_sandbox;
+            self.bottom_pane
+                .set_windows_degraded_sandbox_active(enabled);
+        }
     }
 
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -76,12 +122,16 @@ impl ChatWidget {
             );
         }
         let enabled = self.config.features.enabled(feature);
-        if feature == Feature::FastMode {
+        if matches!(
+            feature,
+            Feature::CliDaybreak | Feature::ApiKeyCyberAccessPrograms
+        ) {
+            self.set_daybreak_enabled(self.daybreak_enabled);
+            self.refresh_status_surfaces();
+        }
+        if matches!(feature, Feature::FastMode | Feature::UltrafastMode) {
             self.refresh_effective_service_tier();
             self.sync_service_tier_commands();
-        }
-        if feature == Feature::Worktrees {
-            self.sync_worktrees_enabled();
         }
         if feature == Feature::Plugins {
             self.sync_plugins_command_enabled();
@@ -97,37 +147,11 @@ impl ChatWidget {
                 self.update_collaboration_mode_indicator();
             }
         }
-        if feature == Feature::RealtimeConversation && !enabled {
-            self.realtime_conversation_available_for_thread = false;
-            self.bottom_pane
-                .set_voice_command_enabled(/*enabled*/ false);
-            self.stop_realtime_conversation();
-        }
-        if feature == Feature::RealtimeConversation
-            && enabled
-            && !self.realtime_conversation_available_for_thread
-        {
-            self.add_info_message(
-                "Voice conversations will be available in new threads.".into(),
-                /*hint*/ None,
-            );
-        }
         if feature == Feature::MentionsV2 {
             self.sync_mentions_v2_enabled();
         }
         if feature == Feature::PreventIdleSleep {
             self.turn_lifecycle.set_prevent_idle_sleep(enabled);
-        }
-        #[cfg(target_os = "windows")]
-        if matches!(
-            feature,
-            Feature::WindowsSandbox | Feature::WindowsSandboxElevated
-        ) {
-            self.bottom_pane
-                .set_windows_degraded_sandbox_active(matches!(
-                    crate::windows_sandbox::level_from_config(&self.config),
-                    WindowsSandboxLevel::RestrictedToken
-                ));
         }
         enabled
     }
@@ -189,6 +213,13 @@ impl ChatWidget {
         self.model_catalog.clone()
     }
 
+    pub(crate) fn on_account_email_loaded(&mut self, current_email: Option<String>) {
+        if let Some(StatusAccountDisplay::ChatGpt { email, .. }) = &mut self.status_account_display
+        {
+            *email = current_email;
+        }
+    }
+
     pub(crate) fn current_plan_type(&self) -> Option<PlanType> {
         self.plan_type
     }
@@ -211,7 +242,10 @@ impl ChatWidget {
         // Account-update notifications are the identity boundary. The visible account fields can
         // be identical across two accounts, so always invalidate account-scoped requests and data.
         self.model_popup_request_id = None;
+        let api_key_changed = self.status_account_display == Some(StatusAccountDisplay::ApiKey)
+            || status_account_display == Some(StatusAccountDisplay::ApiKey);
         self.invalidate_permission_discovery();
+        self.permission_discovery = None;
         self.invalidate_connector_scope();
         self.clear_pending_rate_limit_reset_requests();
         self.clear_backend_banner();
@@ -222,6 +256,7 @@ impl ChatWidget {
         self.codex_rate_limit_reached_type = None;
         self.codex_spend_control_reached = None;
         self.rate_limit_warnings = RateLimitWarningState::default();
+        self.usage_notice_state = usage_notice::UsageNoticeState::default();
         self.rate_limit_switch_prompt = RateLimitSwitchPromptState::Idle;
         self.bottom_pane
             .dismiss_view_by_id(RATE_LIMIT_SWITCH_PROMPT_VIEW_ID);
@@ -241,6 +276,10 @@ impl ChatWidget {
         self.status_account_display = status_account_display;
         self.plan_type = plan_type;
         self.has_chatgpt_account = has_chatgpt_account;
+        if api_key_changed {
+            self.refresh_account_scoped_models();
+        }
+        self.set_daybreak_enabled(self.daybreak_enabled);
         self.has_codex_backend_auth = has_codex_backend_auth;
         self.bottom_pane
             .set_connectors_enabled(self.connectors_enabled());
@@ -252,6 +291,7 @@ impl ChatWidget {
 
     /// Set the syntax theme override in the widget's config copy.
     pub(crate) fn set_tui_theme(&mut self, theme: Option<String>) {
+        self.config_panel_tui.theme.clone_from(&theme);
         self.local_settings.tui.theme = theme;
     }
 
@@ -295,9 +335,8 @@ impl ChatWidget {
     }
 
     pub(super) fn sync_worktrees_enabled(&mut self) {
-        self.bottom_pane.set_worktrees_enabled(
-            self.config.features.enabled(Feature::Worktrees) && self.local_worktree_operations,
-        );
+        self.bottom_pane
+            .set_worktrees_enabled(self.local_worktree_operations);
     }
 
     pub(super) fn sync_plugins_command_enabled(&mut self) {
@@ -426,6 +465,8 @@ impl ChatWidget {
 
     pub(super) fn refresh_model_display(&mut self) {
         let effective = self.effective_collaboration_mode();
+        self.bottom_pane
+            .stop_ineligible_sparkle(effective.model(), &self.local_settings.tui);
         self.session_header.set_model(effective.model());
         // Keep composer paste affordances aligned with the currently effective model.
         self.sync_image_paste_enabled();
@@ -457,9 +498,17 @@ impl ChatWidget {
         self.apply_thread_settings_cwd(settings.cwd.clone());
         self.config.model_provider_id = settings.model_provider.clone();
         self.set_service_tier(settings.service_tier.clone());
-        self.set_approval_policy(settings.approval_policy);
+        if let Err(err) = self
+            .config
+            .permissions
+            .approval_policy
+            .set(settings.approval_policy.to_core())
+        {
+            tracing::warn!(%err, "failed to sync approval_policy from ThreadSettingsUpdated");
+            self.config.permissions.approval_policy =
+                Constrained::allow_only(settings.approval_policy.to_core());
+        }
         self.set_approvals_reviewer(settings.approvals_reviewer.to_core());
-        self.config.personality = settings.personality;
 
         let permission_profile = PermissionProfile::from_legacy_sandbox_policy_for_cwd(
             &settings.sandbox_policy.to_core(),
@@ -494,6 +543,15 @@ impl ChatWidget {
         self.refresh_status_surfaces();
         self.sync_service_tier_commands();
         if cwd_changed {
+            #[cfg(target_os = "windows")]
+            if self.windows_sandbox_local_server
+                && let Some(thread_id) = self.thread_id
+            {
+                self.windows_sandbox_config = Default::default();
+                self.set_windows_sandbox_mode(/*mode*/ None);
+                self.app_event_tx
+                    .send(AppEvent::RefreshWindowsSandbox { thread_id });
+            }
             self.invalidate_connector_scope();
             self.refresh_skills_for_current_cwd(/*force_reload*/ true);
             self.refresh_connector_mentions(/*force_refresh*/ false);
@@ -504,6 +562,9 @@ impl ChatWidget {
 
     fn apply_thread_settings_cwd(&mut self, cwd: AbsolutePathBuf) {
         let previous_cwd = std::mem::replace(&mut self.config.cwd, cwd.clone());
+        if previous_cwd != cwd {
+            self.permission_discovery = None;
+        }
         self.current_cwd = Some(cwd.to_path_buf());
         self.status_line_project_root_name_cache = None;
 
@@ -543,12 +604,12 @@ impl ChatWidget {
         self.refresh_model_dependent_surfaces();
     }
 
-    pub(super) fn model_display_name(&self) -> &str {
+    pub(crate) fn model_display_name(&self) -> &str {
         let model = self.current_model();
         if model.is_empty() {
             DEFAULT_MODEL_DISPLAY_NAME
         } else {
-            crate::model_catalog::model_display_name(model)
+            self.model_catalog.display_name(model)
         }
     }
 
@@ -699,13 +760,11 @@ impl ChatWidget {
                 /*approvals_reviewer*/ None,
                 /*permission_profile*/ None,
                 /*active_permission_profile*/ None,
-                /*windows_sandbox_level*/ None,
                 /*model*/ None,
                 /*effort*/ None,
                 /*summary*/ None,
                 /*service_tier*/ None,
                 Some(self.effective_collaboration_mode()),
-                /*personality*/ None,
             ),
         });
     }

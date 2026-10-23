@@ -23,7 +23,7 @@ use std::collections::HashMap;
 const PREVIEW_CHARS: usize = 512;
 
 pub(super) fn preview_agent_message(text: &str) -> String {
-    preview_markdown(&crate::markdown::unwrap_markdown_fences(text))
+    preview_markdown(&crate::markdown::normalize_markdown_for_rendering(text))
 }
 
 pub(super) fn preview_markdown(text: &str) -> String {
@@ -230,7 +230,11 @@ impl App {
         self.agents_overview
             .dispatched_requests
             .get(&thread_id)
-            .and_then(|requests| requests.iter().find_map(request_preview))
+            .and_then(|requests| {
+                requests
+                    .iter()
+                    .find_map(|request| request_preview(&request.request))
+            })
             .or_else(|| {
                 let channel = self
                     .thread_event_channels

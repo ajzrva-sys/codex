@@ -34,6 +34,9 @@ pub(super) struct StatusCopySource {
 #[derive(Default)]
 pub(super) struct TranscriptState {
     pub(super) active_cell: Option<Box<dyn HistoryCell>>,
+    /// Shared retained rows for concurrently running dynamic tools, removed on completion.
+    pub(super) dynamic_calls:
+        std::collections::HashMap<String, crate::history_cell::DynamicToolCallCell>,
     /// Monotonic-ish counter used to invalidate transcript overlay caching.
     pub(super) active_cell_revision: u64,
     /// One bounded entry shared by layout and paint across unchanged active-cell frames.
@@ -45,6 +48,10 @@ pub(super) struct TranscriptState {
     /// Latest `/status` card and fields, retained across copying until a later turn or command.
     pub(super) last_status_copy_targets: Option<StatusCopySource>,
     pub(super) last_completed_agent_message: Option<(String, String)>,
+    /// Turn and item IDs for the agent message currently supplying streamed deltas.
+    pub(super) active_streamed_agent_message: Option<(String, String)>,
+    /// Turn/item identity and raw source of the latest interleaved stream flush.
+    pub(super) last_flushed_agent_message: Option<((String, String), String)>,
     /// Raw markdown of the most recently completed proposed plan.
     pub(super) latest_proposed_plan_markdown: Option<String>,
     /// Whether this turn already produced a copyable response.
@@ -88,7 +95,8 @@ impl TranscriptState {
 
     pub(super) fn record_agent_markdown(&mut self, markdown: String, source: String) {
         self.last_status_copy_targets = None;
-        self.last_agent_markdown = Some(markdown);
+        self.last_agent_markdown =
+            Some(crate::markdown_render::followup_labels(&markdown).into_owned());
         self.last_agent_source = Some(source);
         self.saw_copy_source_this_turn = true;
     }
@@ -103,6 +111,8 @@ impl TranscriptState {
     pub(super) fn reset_turn_flags(&mut self) {
         self.saw_copy_source_this_turn = false;
         self.last_completed_agent_message = None;
+        self.active_streamed_agent_message = None;
+        self.last_flushed_agent_message = None;
         self.saw_plan_update_this_turn = false;
         self.saw_plan_item_this_turn = false;
         self.latest_proposed_plan_markdown = None;

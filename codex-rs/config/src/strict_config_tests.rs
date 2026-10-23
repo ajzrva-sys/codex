@@ -6,6 +6,7 @@ use crate::config_toml::ConfigToml;
 use crate::diagnostics::TextPosition;
 use crate::diagnostics::TextRange;
 use pretty_assertions::assert_eq;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[test]
@@ -85,6 +86,82 @@ foo = true"#;
             TextRange {
                 start: TextPosition { line: 3, column: 1 },
                 end: TextPosition { line: 3, column: 3 },
+            },
+            "unknown configuration field `features.foo`",
+        )
+    );
+}
+
+#[test]
+fn strict_config_rejects_unknown_tui_key() {
+    let path = Path::new("/tmp/config.toml");
+    let contents = r#"
+[tui]
+bogus_key_xyz = 1"#;
+
+    let error = config_error_from_ignored_toml_fields::<ConfigToml>(path, contents)
+        .expect("unknown TUI key error");
+
+    assert_eq!(
+        error,
+        ConfigError::new(
+            path.to_path_buf(),
+            TextRange {
+                start: TextPosition { line: 3, column: 1 },
+                end: TextPosition {
+                    line: 3,
+                    column: 13,
+                },
+            },
+            "unknown configuration field `tui.bogus_key_xyz`",
+        )
+    );
+}
+
+#[test]
+fn strict_config_accepts_tui_notification_settings() {
+    let path = Path::new("/tmp/config.toml");
+
+    for contents in [
+        "[tui]\nnotifications = false\n",
+        "[tui]\nnotification_method = \"bel\"\n",
+        "[tui]\nnotification_condition = \"always\"\n",
+    ] {
+        assert_eq!(
+            config_error_from_ignored_toml_fields::<ConfigToml>(path, contents),
+            None
+        );
+    }
+}
+
+#[test]
+fn generic_validation_does_not_apply_config_toml_tui_fields() {
+    let path = Path::new("/tmp/config.toml");
+    let contents = "[tui]\nplugin_key = 1\n";
+
+    assert_eq!(
+        config_error_from_ignored_toml_fields::<BTreeMap<String, BTreeMap<String, i32>>>(
+            path, contents,
+        ),
+        None
+    );
+}
+
+#[test]
+fn wrapped_config_toml_still_rejects_unknown_feature_key() {
+    let path = Path::new("/tmp/config.toml");
+    let contents = "[features]\nfoo = true\n";
+
+    let error = config_error_from_ignored_toml_fields::<Box<ConfigToml>>(path, contents)
+        .expect("unknown feature error");
+
+    assert_eq!(
+        error,
+        ConfigError::new(
+            path.to_path_buf(),
+            TextRange {
+                start: TextPosition { line: 2, column: 1 },
+                end: TextPosition { line: 2, column: 3 },
             },
             "unknown configuration field `features.foo`",
         )
@@ -199,5 +276,22 @@ include_view_image_tool = false
     assert_eq!(
         ignored_config_warning(&config, &[]).unwrap(),
         "Codex is ignoring 3 unrecognized configuration settings. Check for typos or deprecated settings.\n  enterprise-managed (Defaults, cfg): `model_providers.custom.unknown_timeout` is ignored.\n  session-flags: `model_providers.custom.unknown_timeout` is ignored.\n  session-flags: `profiles.work.features.include_view_image_tool` is ignored. Use [features].view_image to configure the image tool."
+    );
+}
+
+#[test]
+fn removed_private_desktop_setting_has_migration_hint() {
+    let config = ConfigLayerStack::new(
+        vec![layer(
+            ConfigLayerSource::SessionFlags,
+            "[windows]\nsandbox_private_desktop = false",
+        )],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        ignored_config_warning(&config, &[]).unwrap(),
+        "Codex is ignoring 1 unrecognized configuration setting. Check for typos or deprecated settings.\n  session-flags: `windows.sandbox_private_desktop` is ignored. Remove windows.sandbox_private_desktop; legacy Windows sandboxes always use a private desktop."
     );
 }
