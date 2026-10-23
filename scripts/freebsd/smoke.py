@@ -6,9 +6,11 @@ import json
 import os
 import platform
 import shlex
+import signal
 import subprocess
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from configure_sandbox import PROFILE
@@ -63,7 +65,7 @@ def main() -> None:
                     "arguments": json.dumps(
                         {
                             "cmd": command,
-                            "yield_time_ms": 1000,
+                            "yield_time_ms": 30000,
                             "max_output_tokens": 1000,
                         }
                     ),
@@ -166,7 +168,7 @@ supports_websockets = false
             if args.implicit_defaults == "trusted":
                 config += f'\n[projects.{json.dumps(str(workspace))}]\ntrust_level = "trusted"\n'
             (config_home / "config.toml").write_text(config)
-            result = subprocess.run(
+            process = subprocess.Popen(
                 [
                     str(binary),
                     "-a",
@@ -184,9 +186,38 @@ supports_websockets = false
                     **({"HOME": str(home)} if args.implicit_defaults else {}),
                 },
                 text=True,
-                capture_output=True,
-                timeout=90,
-                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            try:
+                stdout, stderr = process.communicate(timeout=90)
+            finally:
+                # The CLI may leave a plugin clone child alive after it exits.
+                # Reap only the private process group created by this fixture.
+                for sig in (signal.SIGTERM, signal.SIGKILL):
+                    try:
+                        os.killpg(process.pid, sig)
+                    except ProcessLookupError:
+                        break
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        process.poll()
+                        try:
+                            os.killpg(process.pid, 0)
+                        except ProcessLookupError:
+                            break
+                        time.sleep(0.025)
+                    else:
+                        continue
+                    break
+                else:
+                    raise RuntimeError(
+                        "private smoke process group did not exit after SIGKILL"
+                    )
+                process.wait(timeout=5)
+            result = subprocess.CompletedProcess(
+                process.args, process.returncode, stdout, stderr
             )
             if result.returncode:
                 raise RuntimeError(result.stdout + result.stderr)

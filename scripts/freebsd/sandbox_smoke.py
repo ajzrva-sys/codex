@@ -185,7 +185,10 @@ def main() -> None:
                 (sibling / "credential", False),
             ]:
                 result = subprocess.run(
-                    command(shlex.join([client, "--codex-run-as-fs-helper"])),
+                    command(
+                        shlex.join([client, "--codex-run-as-fs-helper"]),
+                        profile(workspace, [entry(Path(client), "read")]),
+                    ),
                     input=json.dumps(
                         {"operation": "fs/open", "params": {"path": path.as_uri()}}
                     ).encode(),
