@@ -69,6 +69,61 @@ pub(super) fn active_arg0_helper_dir(
         .and_then(|path| AbsolutePathBuf::from_absolute_path(path).ok())
 }
 
+/// Use jail-compatible roots only for FreeBSD's unselected startup defaults.
+#[cfg(target_os = "freebsd")]
+pub(super) fn freebsd_implicit_permission_profile(
+    profile: &PermissionProfile,
+    protected_roots: &[AbsolutePathBuf],
+) -> PermissionProfile {
+    let (mut file_system, network) = profile.to_runtime_permissions();
+    file_system.entries.retain(|entry| {
+        !(entry.access == FileSystemAccessMode::Read
+            && matches!(
+                entry.path,
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Root
+                }
+            ))
+    });
+    file_system.entries.push(FileSystemSandboxEntry::new(
+        FileSystemPath::Special {
+            value: FileSystemSpecialPath::Minimal,
+        },
+        FileSystemAccessMode::Read,
+    ));
+    if !file_system.entries.iter().any(|entry| {
+        matches!(
+            entry.path,
+            FileSystemPath::Special {
+                value: FileSystemSpecialPath::ProjectRoots { subpath: None }
+            }
+        )
+    }) {
+        file_system.entries.push(FileSystemSandboxEntry::new(
+            FileSystemPath::Special {
+                value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+            },
+            FileSystemAccessMode::Read,
+        ));
+    }
+    for path in protected_roots {
+        let deny = FileSystemSandboxEntry::new(
+            FileSystemPath::Path {
+                path: PathUri::from_abs_path(path),
+            },
+            FileSystemAccessMode::Deny,
+        );
+        if !file_system.entries.contains(&deny) {
+            file_system.entries.push(deny);
+        }
+    }
+    PermissionProfile::from_runtime_permissions_with_enforcement(
+        profile.enforcement(),
+        &file_system,
+        network,
+    )
+}
+
 pub(crate) fn default_builtin_permission_profile_name(
     active_project: &ProjectConfig,
     windows_sandbox_level: WindowsSandboxLevel,

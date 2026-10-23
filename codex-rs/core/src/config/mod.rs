@@ -3588,6 +3588,21 @@ impl Config {
             sandbox_mode,
         );
         let requirements_toml = config_layer_stack.requirements_toml();
+        // Capture selection intent before persisted candidates are filtered or moved.
+        #[cfg(target_os = "freebsd")]
+        let freebsd_native_implicit_default = sandbox_mode.is_none()
+            && permission_profile.is_none()
+            && default_permissions_override.is_none()
+            && persisted_permission_profile_id.is_none()
+            && persisted_permission_profile.is_none()
+            && cfg.sandbox_mode.is_none()
+            && cfg.sandbox_workspace_write.is_none()
+            && cfg.default_permissions.is_none()
+            && cfg.permissions.is_none()
+            && requirements_toml.allowed_sandbox_modes.is_none()
+            && requirements_toml.allowed_permission_profiles.is_none()
+            && requirements_toml.default_permissions.is_none()
+            && requirements_toml.permissions.is_none();
         let persisted_permission_profile = persisted_permission_profile.filter(|profile| {
             sandbox_mode.is_none()
                 && permission_profile.is_none()
@@ -3800,8 +3815,35 @@ impl Config {
                 builtin_workspace_write_settings.as_ref(),
                 &mut startup_warnings,
             )?;
+            #[cfg(target_os = "freebsd")]
+            let permission_profile = if freebsd_native_implicit_default && using_implicit_builtin_profile {
+                let mut protected_roots = vec![codex_home.clone()];
+                if let Some(home) = AbsolutePathBufGuard::home_directory() {
+                    for name in [".codex", ".ssh"] {
+                        protected_roots.push(AbsolutePathBuf::from_absolute_path(home.join(name))?);
+                    }
+                }
+                // Resolve existing aliases with asynchronous metadata work; never read secrets.
+                for root in protected_roots.clone() {
+                    if let Ok(path) = tokio::fs::canonicalize(root.as_path()).await {
+                        protected_roots.push(AbsolutePathBuf::from_absolute_path(path)?);
+                    }
+                }
+                permissions::freebsd_implicit_permission_profile(&permission_profile, &protected_roots)
+            } else {
+                permission_profile
+            };
             let file_system_sandbox_policy = permission_profile.file_system_sandbox_policy();
-            let active_permission_profile = if using_implicit_builtin_profile
+            let native_implicit_profile = {
+                #[cfg(target_os = "freebsd")]
+                { freebsd_native_implicit_default && using_implicit_builtin_profile }
+                #[cfg(not(target_os = "freebsd"))]
+                { false }
+            };
+            let active_permission_profile = if native_implicit_profile {
+                // Re-selecting the global builtin would restore its root-read rule.
+                None
+            } else if using_implicit_builtin_profile
                 && default_permissions == BUILT_IN_WORKSPACE_PROFILE
                 && cfg.sandbox_workspace_write.is_some()
             {
@@ -5205,6 +5247,10 @@ pub fn log_dir(cfg: &Config) -> std::io::Result<PathBuf> {
 #[cfg(test)]
 #[path = "config_tests.rs"]
 mod tests;
+
+#[cfg(all(test, target_os = "freebsd"))]
+#[path = "freebsd_permissions_tests.rs"]
+mod freebsd_permissions_tests;
 
 #[cfg(test)]
 #[path = "config_loader_tests.rs"]

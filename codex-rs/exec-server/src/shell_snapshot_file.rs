@@ -9,6 +9,16 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 
+/// FreeBSD devfs exposes stdin even when arbitrary /dev/fd paths are absent.
+/// The dot command's redirection restores the original stdin after sourcing.
+pub(super) fn source_command(fd: std::os::fd::RawFd) -> String {
+    if cfg!(target_os = "freebsd") {
+        format!(". /dev/stdin <&{fd}")
+    } else {
+        format!(". /dev/fd/{fd}")
+    }
+}
+
 pub(super) fn materialize(shell: ShellType, state: &str) -> io::Result<File> {
     // Mode 0700 alone cannot stop a same-user sandboxed command from replacing
     // the pathname or retaining a writable handle before unlink. Reuse the root

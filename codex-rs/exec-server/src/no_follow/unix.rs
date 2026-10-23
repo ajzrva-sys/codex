@@ -28,12 +28,17 @@ fn directory_access_flags() -> OFlags {
     OFlags::PATH
 }
 
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
 fn directory_access_flags() -> OFlags {
     OFlags::from_bits_retain(libc::O_SEARCH as u32)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple",
+    target_os = "freebsd"
+)))]
 fn directory_access_flags() -> OFlags {
     OFlags::RDONLY
 }

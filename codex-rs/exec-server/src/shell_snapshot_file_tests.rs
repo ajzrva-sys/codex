@@ -8,7 +8,12 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use test_case::test_case;
 
-#[test_case("/bin/bash", ShellType::Bash; "bash")]
+#[cfg(target_os = "freebsd")]
+const BASH_PATH: &str = "/usr/local/bin/bash";
+#[cfg(not(target_os = "freebsd"))]
+const BASH_PATH: &str = "/bin/bash";
+
+#[test_case(BASH_PATH, ShellType::Bash; "bash")]
 #[cfg_attr(target_os = "macos", test_case("/bin/zsh", ShellType::Zsh; "zsh"))]
 #[tokio::test]
 async fn unnamed_snapshot_preserves_stdin_and_closes_read_only_carrier(
@@ -33,10 +38,15 @@ async fn unnamed_snapshot_preserves_stdin_and_closes_read_only_carrier(
         ),
         (0, libc::FD_CLOEXEC, Some(libc::EBADF)),
     );
-    let closed_check = format!("if [ -e /dev/fd/{fd} ]; then exit 43; fi\n");
+    let closed_check = if cfg!(target_os = "freebsd") {
+        format!("if ( : <&{fd} ) 2>/dev/null; then exit 43; fi\n")
+    } else {
+        format!("if [ -e /dev/fd/{fd} ]; then exit 43; fi\n")
+    };
+    let restore = super::source_command(fd);
     let args = vec![
         "-c".to_string(),
-        format!(". /dev/fd/{fd}\n{closed_check}IFS= read -r line; helper \"$line\"; exit 7"),
+        format!("{restore}\n{closed_check}IFS= read -r line; helper \"$line\"; exit 7"),
     ];
     let env = HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
     let spawned =

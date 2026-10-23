@@ -27,7 +27,14 @@ def main() -> None:
         action="store_true",
         help="run tools through the native V8 helper",
     )
+    parser.add_argument(
+        "--implicit-defaults",
+        choices=("read-only", "trusted"),
+        help="use fresh private HOME and native defaults instead of a configured profile",
+    )
     args = parser.parse_args()
+    if args.implicit_defaults and not args.sandbox:
+        parser.error("--implicit-defaults requires --sandbox")
     binary = args.codex.resolve(strict=True)
     requests = []
 
@@ -47,7 +54,7 @@ def main() -> None:
                         'test "$(sysctl -n security.jail.jailed)" = 1 && '
                         'test ! -r "$HOME/.codex/auth.json" && '
                         f"test ! -r {shlex.quote(str(home / 'credential-fixture'))} && "
-                        "uname -s && printf 'native shell works\\n' > shell.txt"
+                        "uname -s && cat source.txt && printf 'native shell works\\n' > shell.txt"
                     )
                 item = {
                     "type": "function_call",
@@ -129,8 +136,15 @@ def main() -> None:
             (root / "readonly.txt").write_text("UNTOUCHED_FIXTURE")
             workspace = root / "workspace"
             workspace.mkdir()
+            (workspace / "source.txt").write_text("SOURCE_READABLE_FIXTURE\n")
+            config_home = home / ".codex" if args.implicit_defaults else home
+            config_home.mkdir(exist_ok=True)
             config = (
-                ('default_permissions = "freebsd-workspace"\n' if args.sandbox else "")
+                (
+                    'default_permissions = "freebsd-workspace"\n'
+                    if args.sandbox and not args.implicit_defaults
+                    else ""
+                )
                 + f"""
 model = "gpt-5.4"
 model_provider = "local_test"
@@ -145,12 +159,16 @@ supports_websockets = false
             )
             if args.code_mode:
                 config += "\n[features]\ncode_mode = true\ncode_mode_only = true\ncode_mode_host = true\n"
-            if args.sandbox:
+            if args.sandbox and not args.implicit_defaults:
                 config += "\n" + PROFILE
-            (home / "config.toml").write_text(config)
+            if args.implicit_defaults == "trusted":
+                config += f'\n[projects.{json.dumps(str(workspace))}]\ntrust_level = "trusted"\n'
+            (config_home / "config.toml").write_text(config)
             result = subprocess.run(
                 [
                     str(binary),
+                    "-a",
+                    "never",
                     "exec",
                     "--skip-git-repo-check",
                     *([] if args.sandbox else ["--sandbox", "danger-full-access"]),
@@ -158,7 +176,11 @@ supports_websockets = false
                     "Run the native shell and patch smoke test.",
                 ],
                 cwd=workspace,
-                env={**os.environ, "CODEX_HOME": str(home)},
+                env={
+                    **os.environ,
+                    "CODEX_HOME": str(config_home),
+                    **({"HOME": str(home)} if args.implicit_defaults else {}),
+                },
                 text=True,
                 capture_output=True,
                 timeout=90,
@@ -166,14 +188,26 @@ supports_websockets = false
             )
             if result.returncode:
                 raise RuntimeError(result.stdout + result.stderr)
-            assert (workspace / "shell.txt").is_file(), result.stdout + result.stderr
-            assert (workspace / "patch.txt").is_file(), result.stdout + result.stderr
-            assert (workspace / "shell.txt").read_text() == "native shell works\n", (
-                result.stdout
-            )
-            assert (workspace / "patch.txt").read_text() == "native patch works\n", (
-                result.stdout
-            )
+            if args.implicit_defaults == "read-only":
+                assert not (workspace / "shell.txt").exists(), (
+                    result.stdout + result.stderr
+                )
+                assert not (workspace / "patch.txt").exists(), (
+                    result.stdout + result.stderr
+                )
+            else:
+                assert (workspace / "shell.txt").is_file(), (
+                    result.stdout + result.stderr
+                )
+                assert (workspace / "patch.txt").is_file(), (
+                    result.stdout + result.stderr
+                )
+                assert (
+                    workspace / "shell.txt"
+                ).read_text() == "native shell works\n", result.stdout
+                assert (
+                    workspace / "patch.txt"
+                ).read_text() == "native patch works\n", result.stdout
             assert "FREEBSD_SMOKE_OK" in result.stdout, result.stdout
             assert len(requests) == (5 if args.sandbox else 3), len(requests)
             if args.sandbox:
@@ -192,8 +226,12 @@ supports_websockets = false
             assert any(platform.system() in json.dumps(item) for item in outputs), (
                 outputs
             )
+            if args.implicit_defaults:
+                assert any(
+                    "SOURCE_READABLE_FIXTURE" in json.dumps(item) for item in outputs
+                ), outputs
             print(
-                f"PASS: {platform.system()} shell execution, file writes, apply_patch, and Responses round trip (code mode: {args.code_mode})"
+                f"PASS: {platform.system()} shell execution, file writes, apply_patch, and Responses round trip (code mode: {args.code_mode}, implicit defaults: {args.implicit_defaults})"
             )
     finally:
         server.shutdown()

@@ -27,6 +27,11 @@ use crate::protocol::ShellInfo;
 use crate::protocol::ShellSnapshotRequest;
 use crate::telemetry::ExecServerTelemetry;
 
+#[cfg(target_os = "freebsd")]
+const BASH_PATH: &str = "/usr/local/bin/bash";
+#[cfg(not(target_os = "freebsd"))]
+const BASH_PATH: &str = "/bin/bash";
+
 #[test_case(1, CapturePurpose::Execution; "succeeds_on_first_attempt")]
 #[test_case(2, CapturePurpose::Execution; "recovers_on_second_attempt")]
 #[test_case(3, CapturePurpose::Execution; "recovers_on_last_attempt")]
@@ -46,11 +51,7 @@ async fn snapshot_failure_retries_are_bounded_and_single_flight(
     let params = ExecParams {
         metadata: Default::default(),
         process_id: ProcessId::from("snapshot-retry"),
-        argv: vec![
-            "/bin/bash".to_string(),
-            "-lc".to_string(),
-            "true".to_string(),
-        ],
+        argv: vec![BASH_PATH.to_string(), "-lc".to_string(), "true".to_string()],
         cwd: codex_utils_path_uri::PathUri::from_host_native_path(home.path())?,
         env: HashMap::from([
             (
@@ -64,7 +65,7 @@ async fn snapshot_failure_retries_are_bounded_and_single_flight(
             scope_id: "attachment-1".to_string(),
             shell: ShellInfo {
                 name: "bash".to_string(),
-                path: "/bin/bash".to_string(),
+                path: BASH_PATH.to_string(),
             },
         }),
         tty: false,
@@ -139,8 +140,9 @@ async fn snapshot_failure_retries_are_bounded_and_single_flight(
         for (prepared, reader) in [(&mut prepared, first), (&mut concurrent, second)] {
             if let Some(reader) = reader {
                 let fd = std::os::fd::AsRawFd::as_raw_fd(&reader);
-                prepared.command[2] =
-                    prepared.command[2].replace(&format!("/dev/fd/{fd}"), "/dev/fd/SNAPSHOT");
+                prepared.command[2] = prepared.command[2]
+                    .replace(&format!("/dev/fd/{fd}"), "/dev/fd/SNAPSHOT")
+                    .replace(&format!("<&{fd}"), "<&SNAPSHOT");
             }
         }
         assert_eq!(

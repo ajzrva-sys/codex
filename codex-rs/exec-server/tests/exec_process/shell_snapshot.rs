@@ -47,7 +47,7 @@ async fn shell_snapshot_preserves_successful_startup_output_and_services(
                 metadata: Default::default(),
                 process_id: format!("startup-capture-{index}").into(),
                 argv: vec![
-                    format!("/bin/{shell}"),
+                    test_shell_path(shell),
                     "-lc".to_string(),
                     format!(
                         "[ \"$SNAPSHOT_SERVICE_PID\" = \"$(/bin/cat \"$HOME/service-pid\")\" ] || exit 41\ncase \"$(/bin/ps -o stat= -p \"$SNAPSHOT_SERVICE_PID\")\" in ''|*Z*) exit 42;; esac\nprofile_helper {index}"
@@ -66,7 +66,7 @@ async fn shell_snapshot_preserves_successful_startup_output_and_services(
                     scope_id: "startup-capture".to_string(),
                     shell: ShellInfo {
                         name: shell.to_string(),
-                        path: format!("/bin/{shell}"),
+                        path: test_shell_path(shell),
                     },
                 }),
                 tty: false,
@@ -145,6 +145,9 @@ async fn shell_snapshot_concurrent_replays_keep_independent_readers(
     };
     let source_check = if deny_fd_path {
         String::new()
+    } else if cfg!(target_os = "freebsd") {
+        // Source the anonymous carrier through devfs's standard stdin node.
+        format!("case \"{source}\" in /dev/stdin) ;; *) return 42 ;; esac; ")
     } else {
         format!("case \"{source}\" in /dev/fd/*) ;; *) return 42 ;; esac; ")
     };
@@ -211,7 +214,7 @@ async fn shell_snapshot_concurrent_replays_keep_independent_readers(
                 .start(ExecParams {
                     metadata: Default::default(),
                     process_id: format!("parallel-{index}").into(),
-                    argv: vec![format!("/bin/{shell}"), "-lc".to_string(), command],
+                    argv: vec![test_shell_path(shell), "-lc".to_string(), command],
                     cwd,
                     env: HashMap::new(),
                     env_policy: Some(ExecEnvPolicy {
@@ -232,7 +235,7 @@ async fn shell_snapshot_concurrent_replays_keep_independent_readers(
                         scope_id: "parallel".to_string(),
                         shell: ShellInfo {
                             name: shell.to_string(),
-                            path: format!("/bin/{shell}"),
+                            path: test_shell_path(shell),
                         },
                     }),
                     tty,

@@ -74,6 +74,22 @@ use common::current_test_binary_helper_paths;
 use common::exec_server::ExecServerHarness;
 use common::exec_server::exec_server;
 
+#[cfg(target_os = "freebsd")]
+const BASH_PATH: &str = "/usr/local/bin/bash";
+#[cfg(all(unix, not(target_os = "freebsd")))]
+const BASH_PATH: &str = "/bin/bash";
+
+#[cfg(unix)]
+fn test_shell_path(shell: &str) -> String {
+    if shell == "bash" {
+        BASH_PATH.to_string()
+    } else if cfg!(target_os = "freebsd") && shell == "zsh" {
+        "/usr/local/bin/zsh".to_string()
+    } else {
+        format!("/bin/{shell}")
+    }
+}
+
 struct ProcessContext {
     backend: Arc<dyn ExecBackend>,
     _server: Option<ExecServerHarness>,
@@ -229,10 +245,10 @@ async fn shell_snapshot_v2_filters_profile_exports_and_stays_in_memory(
     let home = TempDir::new()?;
     let cwd = PathUri::from_host_native_path(home.path())?;
     let (shell_path, profile_name) = match shell_name {
-        "bash" if automatic_startup => ("/bin/bash", ".bash-env"),
-        "bash" => ("/bin/bash", ".bashrc"),
+        "bash" if automatic_startup => (BASH_PATH, ".bash-env"),
+        "bash" => (BASH_PATH, ".bashrc"),
         "sh" => ("/bin/sh", ".snapshot-env"),
-        "bash-sh" => ("/bin/bash", ".snapshot-env"),
+        "bash-sh" => (BASH_PATH, ".snapshot-env"),
         "zsh" if automatic_startup => ("/bin/zsh", ".zshenv"),
         "zsh" => ("/bin/zsh", ".zshrc"),
         name => anyhow::bail!("unsupported test shell {name}"),
@@ -444,7 +460,7 @@ async fn exec_metadata_overrides_policy_and_cached_snapshot(
                 }),
                 process_id: ProcessId::from(format!("metadata-snapshot-{attempt}")),
                 argv: vec![
-                    "/bin/bash".into(),
+                    BASH_PATH.into(),
                     "-lc".into(),
                     "printf '%s|%s' \"$CODEX_THREAD_ID\" \"${CODEX_TOOL_CALL_ID-unset}\""
                         .to_string(),
@@ -455,7 +471,7 @@ async fn exec_metadata_overrides_policy_and_cached_snapshot(
                     scope_id: "metadata-attachment".into(),
                     shell: ShellInfo {
                         name: "bash".into(),
-                        path: "/bin/bash".into(),
+                        path: BASH_PATH.into(),
                     },
                 }),
                 env: HashMap::from([
@@ -527,7 +543,7 @@ async fn shell_snapshot_v2_remote_managed_proxy_uses_prepared_execution_context(
     const VENDOR_TOKEN: &str = "vendor_abcdefgh";
     const CUSTOM_HOST: &str = "chatgpt.com";
     let configured_provider = shell_name == "bash" && shell_args.first() == Some(&"-c");
-    let shell_path = format!("/bin/{shell_name}");
+    let shell_path = test_shell_path(shell_name);
     if shell_name == "zsh" && !std::path::Path::new(&shell_path).exists() {
         eprintln!("skipping zsh test: {shell_path} is unavailable");
         return Ok(());
@@ -990,7 +1006,7 @@ async fn shell_snapshot_v2_capture_failure_falls_back_and_retries(
     let home = TempDir::new()?;
     let cwd = PathUri::from_host_native_path(home.path())?;
     let (shell_path, profile_name) = match shell_name {
-        "bash" => ("/bin/bash", ".bashrc"),
+        "bash" => (BASH_PATH, ".bashrc"),
         "zsh" => ("/bin/zsh", ".zshrc"),
         name => anyhow::bail!("unsupported test shell {name}"),
     };

@@ -101,10 +101,9 @@ python3 "$(npm root -g)/@openai/codex/freebsd/install_sandbox.py" \
 
 The administrator installer enables a root-owned service that creates jails for the allowed user. Installing the npm package alone does not enable that service.
 
-**4. Configure, sign in, and run as your regular user:**
+**4. Sign in and run as your regular user:**
 
 ```sh
-python3 "$(npm root -g)/@openai/codex/freebsd/configure_sandbox.py"
 codex login --device-auth
 cd /path/to/project
 codex doctor
@@ -112,7 +111,7 @@ codex sandbox -- /bin/sh -c 'id; sysctl security.jail.jailed'
 codex -a on-request
 ```
 
-The `freebsd-workspace` profile allows project writes and runtime reads, with networking disabled for tool commands. Codex and its authenticated connection run as your regular user outside the jail; tools run as that same user inside it, without access to host credentials. An unavailable sandbox service blocks sandboxed commands.
+Fresh FreeBSD defaults grant runtime and project reads; trusted projects also receive workspace and temporary-directory writes. Tools cannot read `CODEX_HOME`, `~/.codex`, or `~/.ssh`. Explicit, saved, and managed permission selections retain their existing meaning. The optional `freebsd/configure_sandbox.py` selects the named `freebsd-workspace` profile for project writes with networking disabled. Codex and its authenticated connection run as your regular user outside the jail; tools run as that same user inside it. An unavailable sandbox service blocks sandboxed commands.
 
 See the [FreeBSD build and sandbox guide](./scripts/freebsd/README.md) for additional path grants, networking, validation, limitations, and rollback.
 

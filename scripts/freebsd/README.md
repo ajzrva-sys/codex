@@ -95,15 +95,21 @@ allowlist at `/usr/local/etc/codex-freebsd-sandbox.json`, and enables the
 Npm installation itself does not enable privileged services. No SUID executable
 or changes to `vfs.usermount` or `security.bsd.unprivileged_chroot` are needed.
 
-As your regular user, select the named permission profile, then verify it:
+As your regular user, verify the service from your project:
 
 ```sh
-python3 "$(npm root -g)/@openai/codex/freebsd/configure_sandbox.py"
 cd /path/to/project
 codex doctor
 codex sandbox -- /bin/sh -c 'id; sysctl security.jail.jailed'
 codex -a on-request
 ```
+
+Without a permission selection, FreeBSD grants installed runtime and project
+reads. Trusted projects also receive workspace and temporary-directory writes.
+`CODEX_HOME`, `~/.codex`, and `~/.ssh` remain denied, including when the workspace
+is the user's home. Explicit, persisted, managed, and legacy selections are
+unchanged. The optional `configure_sandbox.py` selects `freebsd-workspace` for
+project writes without first changing project trust.
 
 The `freebsd-workspace` profile grants project writes and reads of installed
 runtime tools, libraries, headers, and shared resources. It provides private
@@ -121,12 +127,16 @@ parent's directory entries; writes to the granted file still reach the host.
 Each tool invocation constructs a fresh view.
 Streamed file reads copy the jailed file into an anonymous temporary snapshot
 outside the jail, using bounded buffers. No host socket is passed into the jail
-to transfer descriptors.
+to transfer descriptors. Streamed replacements keep the writable file inside the
+jail and acknowledge each bounded positional block after its write finishes.
 
 To grant another directory, add its absolute path with `"read"`, `"write"`, or
 `"deny"` under `[permissions.freebsd-workspace.filesystem]`. Concrete nested
 exceptions are supported. Symlinked source paths are rejected; use their real
-absolute paths. Filesystem glob policies, full-host-root views (including legacy
+absolute paths. A workspace containing a symlinked protected credential or metadata
+root (including `.codex`, `.ssh`, or `CODEX_HOME`) also fails closed during setup;
+this includes using the home directory as the workspace when such an entry is a
+symlink. The logical protection is retained. Filesystem glob policies, full-host-root views (including legacy
 `-s workspace-write` / `-s read-only` profiles), and managed network proxies are
 rejected. Service errors block execution; there is no automatic unsandboxed
 fallback. Explicit danger-full-access/approval bypasses retain their existing

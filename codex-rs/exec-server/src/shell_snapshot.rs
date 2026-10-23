@@ -321,7 +321,7 @@ impl ShellSnapshotCache {
             .retain(|name, _| !shell_environment::is_non_inheritable_env_var(name));
 
         let restore = if let Some(reader) = &reader {
-            format!(". /dev/fd/{}", reader.as_raw_fd())
+            crate::shell_snapshot_file::source_command(reader.as_raw_fd())
         } else {
             let mut state = snapshot.state.as_str();
             let mut state_variables = Vec::new();
@@ -432,8 +432,13 @@ done
         let fd = probe.as_raw_fd();
         // Automatic startup has already run: do not call exec/unset here,
         // which may be user functions. Capture exit closes this harmless probe.
+        let input = if cfg!(target_os = "freebsd") {
+            format!("&{fd}")
+        } else {
+            format!("/dev/fd/{fd}")
+        };
         format!(
-            "if case '' in '') ;; esac 2>/dev/null </dev/fd/{fd}; then printf '\\0%s\\0%s\\0' '{SOURCE_MARKER}' 1; else printf '\\0%s\\0%s\\0' '{SOURCE_MARKER}' 0; fi\n{script}"
+            "if case '' in '') ;; esac 2>/dev/null <{input}; then printf '\\0%s\\0%s\\0' '{SOURCE_MARKER}' 1; else printf '\\0%s\\0%s\\0' '{SOURCE_MARKER}' 0; fi\n{script}"
         )
     } else {
         format!("printf '\\0%s\\0%s\\0' '{SOURCE_MARKER}' 0\n{script}")
